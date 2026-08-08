@@ -170,6 +170,47 @@ def test_rich_reinjection_block_is_self_contained():
         assert needle in text, f"missing {needle!r}"
 
 
+def test_failed_delegation_notification_never_claims_complete():
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "deleg_partial",
+        "goal": "unfinished work",
+        "role": "leaf",
+        "model": "m",
+        "status": "failed",
+        "exit_reason": "max_iterations",
+        "summary": "useful but partial",
+        "api_calls": 24,
+        "duration_seconds": 10,
+    })
+
+    assert "ASYNC DELEGATION INCOMPLETE" in text
+    assert "Exit reason: max_iterations" in text
+    assert "Partial output:" in text
+    assert "ASYNC DELEGATION COMPLETE" not in text
+
+
+def test_legacy_completed_status_with_max_iterations_is_incomplete():
+    """Old persisted records may have completed plus max_iterations."""
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "deleg_legacy_partial",
+        "goal": "unfinished legacy work",
+        "role": "leaf",
+        "model": "m",
+        "status": "completed",
+        "exit_reason": "max_iterations",
+        "summary": "useful but incomplete output",
+        "api_calls": 24,
+        "duration_seconds": 10,
+    })
+
+    assert "ASYNC DELEGATION INCOMPLETE" in text
+    assert "Exit reason: max_iterations" in text
+    assert "Partial output:" in text
+    assert "ASYNC DELEGATION COMPLETE" not in text
+
+
 def test_dispatch_rejected_at_capacity():
     ev = threading.Event()
 
@@ -624,6 +665,42 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
+def test_batch_is_not_completed_when_any_child_exhausts_iterations():
+    """A partial child result must keep the aggregate batch incomplete."""
+
+    def runner():
+        return {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "first done",
+                    "exit_reason": "completed",
+                },
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "summary": "second has partial output",
+                    "exit_reason": "max_iterations",
+                },
+            ],
+            "total_duration_seconds": 1.0,
+        }
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["first", "second"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner,
+    )
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "error"
+    rendered = format_process_notification(evt)
+    assert "BATCH INCOMPLETE" in rendered
+    assert "exit_reason=max_iterations" in rendered
+    assert "✗ TASK 2/2" in rendered
+
+
 def test_model_dispatch_forces_background():
     """The MODEL-facing dispatch path forces background=True for any top-level
     delegation (single task OR batch), and keeps it off for an orchestrator
@@ -871,5 +948,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

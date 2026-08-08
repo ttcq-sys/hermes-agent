@@ -311,6 +311,7 @@ async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
             ]
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    monkeypatch.setattr("tools.async_delegation.list_async_delegations", lambda: [])
 
     result = await runner._handle_message(_make_event("/agents"))
 
@@ -318,6 +319,50 @@ async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     assert "**Running background processes:** 1" in result
     assert "proc-1" in result
     running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agents_command_reports_live_async_delegations_truthfully(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+
+    class _FakeRegistry:
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    monkeypatch.setattr(
+        "tools.async_delegation.list_async_delegations",
+        lambda: [
+            {
+                "delegation_id": "deleg_live",
+                "status": "running",
+                "role": "leaf",
+                "dispatched_at": time.time() - 12,
+            },
+            {
+                "delegation_id": "deleg_stopped",
+                "status": "error",
+                "role": "leaf",
+                "dispatched_at": time.time() - 90,
+            },
+        ],
+    )
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "deleg_live" in result
+    assert "deleg_stopped" not in result
+    assert "leaf" in result
 
 
 @pytest.mark.asyncio
@@ -339,6 +384,7 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
             return []
 
     monkeypatch.setattr("tools.process_registry.process_registry", _FakeRegistry())
+    monkeypatch.setattr("tools.async_delegation.list_async_delegations", lambda: [])
 
     result = await runner._handle_message(_make_event("/tasks"))
 

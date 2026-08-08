@@ -2067,11 +2067,13 @@ def _format_async_delegation(evt: dict) -> str:
         goals = evt.get("goals") or []
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
+        batch_succeeded = status in ("completed", "success")
+        batch_label = "COMPLETE" if batch_succeeded else "INCOMPLETE"
         lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+            f"[ASYNC DELEGATION BATCH {batch_label} — {deleg_id}]",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
+            "has stopped. Its consolidated results are below; treat partial "
+            "output as evidence, not completion. You may have moved on since "
             "dispatching — act on these or re-dispatch if things have changed.",
             "",
         ]
@@ -2091,22 +2093,27 @@ def _format_async_delegation(evt: dict) -> str:
         for r in sorted(results, key=lambda x: x.get("task_index", 0)):
             idx = r.get("task_index", 0)
             r_status = r.get("status", "?")
+            r_exit_reason = r.get("exit_reason") or "unknown"
             r_summary = r.get("summary")
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-            icon = "✓" if r_status in ("completed", "success") else "✗"
+            child_succeeded = (
+                r_status in ("completed", "success")
+                and r_exit_reason in ("completed", "success", "unknown")
+            )
+            icon = "✓" if child_succeeded else "✗"
             lines.append("")
             header = f"--- {icon} TASK {idx + 1}/{n}"
             if r_goal:
                 header += f": {r_goal}"
-            header += f"  (status={r_status}"
+            header += f"  (status={r_status}, exit_reason={r_exit_reason}"
             if r.get("api_calls"):
                 header += f", api_calls={r['api_calls']}"
             if r.get("duration_seconds") is not None:
                 header += f", {r['duration_seconds']}s"
             header += ") ---"
             lines.append(header)
-            if r_status in ("completed", "success") and r_summary:
+            if child_succeeded and r_summary:
                 lines.append(r_summary)
             elif r_summary:
                 if r_error:
@@ -2130,8 +2137,14 @@ def _format_async_delegation(evt: dict) -> str:
     if isinstance(dispatched_at, (int, float)):
         age = f" ({_format_age(completed_at - dispatched_at)} ago)"
 
+    exit_reason = evt.get("exit_reason") or "unknown"
+    delegation_succeeded = (
+        status in ("completed", "success")
+        and exit_reason in ("completed", "success", "unknown")
+    )
+    delegation_label = "COMPLETE" if delegation_succeeded else "INCOMPLETE"
     lines = [
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        f"[ASYNC DELEGATION {delegation_label} — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
@@ -2146,9 +2159,12 @@ def _format_async_delegation(evt: dict) -> str:
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")
-    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
+    lines.append(
+        f"Status: {status}   Exit reason: {exit_reason}   "
+        f"API calls: {api_calls}   Duration: {duration}s"
+    )
     lines.append("--- RESULT ---")
-    if status in ("completed", "success") and summary:
+    if delegation_succeeded and summary:
         lines.append(summary)
     elif status == "interrupted":
         lines.append(

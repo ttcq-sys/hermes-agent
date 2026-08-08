@@ -725,15 +725,19 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
+            # A batch is successful only when every required child reached a
+            # real completed terminal state. A useful partial summary from a
+            # max-iteration, timeout, interruption, or failed child must not
+            # promote the aggregate to completed.
             child_results = combined.get("results") or []
             if child_results and all(
-                (r.get("status") not in ("completed", "success"))
+                r.get("status") in ("completed", "success")
+                and r.get("exit_reason") in (None, "", "completed", "success")
                 for r in child_results
             ):
-                status = "error"
-            else:
                 status = "completed"
+            else:
+                status = "error"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {

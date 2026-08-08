@@ -17029,6 +17029,85 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _refresh_async_delegation_working_statuses(
+        self, records: Optional[list[dict]] = None,
+    ) -> None:
+        """Mirror real detached-child lifecycles into thread-local status.
+
+        The status is deliberately generic and ephemeral. It carries no goal,
+        command, path, identifier, or result content. A set of exact
+        platform/chat/thread routes is the source of truth, so two Slack
+        threads cannot overwrite or keep each other's status alive.
+        """
+        if records is None:
+            try:
+                from tools.async_delegation import list_async_delegations
+
+                records = list_async_delegations()
+            except Exception:
+                records = []
+
+        active_routes: set[tuple[str, str, str]] = set()
+        for record in records:
+            if record.get("status") not in {"running", "finalizing"}:
+                continue
+            source = self._build_process_event_source(record)
+            if source is not None:
+                platform_value = getattr(source.platform, "value", source.platform)
+                platform_name = str(platform_value or "")
+                chat_id = str(source.chat_id or "")
+                thread_id = str(source.thread_id or "")
+            else:
+                parsed = _parse_session_key(str(record.get("session_key") or ""))
+                if not parsed:
+                    continue
+                platform_name = str(parsed.get("platform") or "")
+                chat_id = str(parsed.get("chat_id") or "")
+                thread_id = str(parsed.get("thread_id") or "")
+            if platform_name and chat_id and thread_id:
+                active_routes.add((platform_name, chat_id, thread_id))
+
+        previous_routes = set(
+            getattr(self, "_async_delegation_status_routes", set()) or set()
+        )
+        if active_routes == previous_routes:
+            return
+
+        def _adapter(platform_name: str):
+            for platform, adapter in getattr(self, "adapters", {}).items():
+                if getattr(platform, "value", "") == platform_name:
+                    return adapter
+            return None
+
+        for platform_name, chat_id, thread_id in previous_routes - active_routes:
+            adapter = _adapter(platform_name)
+            if not getattr(adapter, "supports_status_text", False):
+                continue
+            try:
+                adapter.set_status_text(chat_id, None)
+                await adapter.stop_typing(
+                    chat_id, metadata={"thread_id": thread_id},
+                )
+            except Exception as exc:
+                logger.debug("async delegation status clear failed: %s", exc)
+
+        # Reassert every still-active route after a topology change. This is
+        # important for adapters whose in-memory phrase store is chat-scoped
+        # while the platform status itself is thread-scoped.
+        for platform_name, chat_id, thread_id in active_routes:
+            adapter = _adapter(platform_name)
+            if not getattr(adapter, "supports_status_text", False):
+                continue
+            try:
+                adapter.set_status_text(chat_id, "subagent working…")
+                await adapter.send_typing(
+                    chat_id, metadata={"thread_id": thread_id},
+                )
+            except Exception as exc:
+                logger.debug("async delegation status update failed: %s", exc)
+
+        self._async_delegation_status_routes = active_routes
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -17045,39 +17124,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
-        while self._running:
-            try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
-                requeue = []
-                async_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
-                        break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
-                    else:
-                        requeue.append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        continue
-                    try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
-                            _pr.completion_queue.put(evt)
-                    except Exception as e:
+        try:
+            while self._running:
+                try:
+                    await self._refresh_async_delegation_working_statuses()
+                    # Peek the queue for async-delegation events. We must NOT
+                    # consume watch/completion events here (other drains own
+                    # them), so requeue anything that isn't ours.
+                    requeue = []
+                    async_events = []
+                    while not _pr.completion_queue.empty():
+                        try:
+                            evt = _pr.completion_queue.get_nowait()
+                        except Exception:
+                            break
+                        if evt.get("type") == "async_delegation":
+                            async_events.append(evt)
+                        else:
+                            requeue.append(evt)
+                    for evt in requeue:
                         _pr.completion_queue.put(evt)
-                        logger.error("Async delegation injection error: %s", e)
-            except Exception as e:
-                logger.debug("Async delegation watcher error: %s", e)
-            await asyncio.sleep(interval)
+                    for evt in async_events:
+                        self._enrich_async_delegation_routing(evt)
+                        synth_text = _format_gateway_process_notification(evt)
+                        if not synth_text:
+                            continue
+                        try:
+                            delivered = await self._deliver_completion_notification(synth_text, evt)
+                            if delivered is False:
+                                _pr.completion_queue.put(evt)
+                        except Exception as e:
+                            _pr.completion_queue.put(evt)
+                            logger.error("Async delegation injection error: %s", e)
+                except Exception as e:
+                    logger.debug("Async delegation watcher error: %s", e)
+                await asyncio.sleep(interval)
+        finally:
+            try:
+                await self._refresh_async_delegation_working_statuses([])
+            except Exception:
+                logger.debug("async delegation status shutdown cleanup failed", exc_info=True)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """

@@ -1018,6 +1018,20 @@ class GatewaySlashCommandsMixin:
             if hasattr(t, "done") and not t.done()
         ]
 
+        active_delegations: list[dict] = []
+        try:
+            from tools.async_delegation import list_async_delegations
+
+            active_delegations = [
+                row for row in list_async_delegations()
+                if row.get("status") in {"running", "finalizing"}
+            ]
+            active_delegations.sort(
+                key=lambda row: float(row.get("dispatched_at") or now)
+            )
+        except Exception:
+            active_delegations = []
+
         lines = [
             t("gateway.agents.header"),
             "",
@@ -1057,11 +1071,31 @@ class GatewaySlashCommandsMixin:
         lines.extend(
             [
                 "",
-                t("gateway.agents.async_jobs", count=len(background_tasks)),
+                t(
+                    "gateway.agents.async_jobs",
+                    count=len(background_tasks) + len(active_delegations),
+                ),
             ]
         )
 
-        if not agent_rows and not running_processes and not background_tasks:
+        for row in active_delegations[:12]:
+            delegation_id = str(row.get("delegation_id") or "?")
+            role = str(row.get("role") or "leaf")
+            dispatched_at = float(row.get("dispatched_at") or now)
+            elapsed = max(0, int(now - dispatched_at))
+            lines.append(
+                f"- `{delegation_id}` · `{role}` · "
+                f"{format_uptime_short(elapsed)} · {row.get('status')}"
+            )
+        if len(active_delegations) > 12:
+            lines.append(t("gateway.agents.more", count=len(active_delegations) - 12))
+
+        if (
+            not agent_rows
+            and not running_processes
+            and not background_tasks
+            and not active_delegations
+        ):
             lines.append("")
             lines.append(t("gateway.agents.none"))
 
