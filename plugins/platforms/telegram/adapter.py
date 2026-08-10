@@ -665,6 +665,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
+        # Some profiles are intentionally inbound-only. Keep the default open
+        # for existing installations, but let a profile make outbound delivery
+        # fail closed without disabling polling or mention intake.
+        self._outbound_enabled: bool = self._coerce_bool_extra("outbound_enabled", True)
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -4007,6 +4011,12 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        if not getattr(self, "_outbound_enabled", True):
+            return SendResult(
+                success=False,
+                error="telegram_outbound_disabled",
+                retryable=False,
+            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 

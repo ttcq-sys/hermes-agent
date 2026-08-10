@@ -428,6 +428,22 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
+    if platform_name == "telegram":
+        outbound_enabled = (getattr(pconfig, "extra", None) or {}).get(
+            "outbound_enabled", True
+        )
+        if isinstance(outbound_enabled, str):
+            outbound_enabled = outbound_enabled.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        else:
+            outbound_enabled = bool(outbound_enabled)
+        if not outbound_enabled:
+            return tool_error("Telegram outbound delivery is disabled for this profile.")
+
     from gateway.platforms.base import BasePlatformAdapter
 
     # Capture [[as_document]] directive before extract_media strips it.
