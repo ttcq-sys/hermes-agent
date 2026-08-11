@@ -1338,6 +1338,7 @@ class PluginManager:
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._discovery_lock = threading.RLock()
+        self._discovery_owner_thread_id: Optional[int] = None
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1369,37 +1370,42 @@ class PluginManager:
 
     def _discover_and_load_serialized(self, force: bool = False) -> None:
         """Run one discovery sweep while every concurrent caller waits."""
+        current_thread_id = threading.get_ident()
+        if self._discovery_owner_thread_id == current_thread_id:
+            if force:
+                raise RuntimeError("forced plugin rediscovery is not reentrant")
+            return
         if self._discovered and not force:
             return
         if env_var_enabled("HERMES_SAFE_MODE"):
             logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
             self._discovered = True
             return
-        if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._cli_commands.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._portable_mcp_servers.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        self._discovered = True
+        self._discovery_owner_thread_id = current_thread_id
         try:
-            self._discover_and_load_inner()
-        except BaseException:
-            self._discovered = False
-            raise
+            if force:
+                self._plugins.clear()
+                self._hooks.clear()
+                self._middleware.clear()
+                self._plugin_tool_names.clear()
+                self._plugin_platform_names.clear()
+                self._cli_commands.clear()
+                self._plugin_commands.clear()
+                self._plugin_skills.clear()
+                self._portable_mcp_servers.clear()
+                self._aux_tasks.clear()
+                self._slack_action_handlers.clear()
+                self._context_engine = None
+            # Set the flag up front as a re-entrancy guard (a plugin's
+            # register() can transitively trigger ordinary discovery again).
+            self._discovered = True
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
+                self._discovered = False
+                raise
+        finally:
+            self._discovery_owner_thread_id = None
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -2176,6 +2182,8 @@ class PluginManager:
     ) -> tuple[Callable, ...]:
         """Return an immutable callback snapshot outside any partial sweep."""
         with self._discovery_lock:
+            if self._discovery_owner_thread_id == threading.get_ident():
+                raise RuntimeError("middleware snapshot requested during discovery")
             if discover:
                 self._discover_and_load_serialized()
             return tuple(self._middleware.get(kind, ()))
