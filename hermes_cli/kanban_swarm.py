@@ -93,6 +93,21 @@ def _activate_root_inline(
     import time as _time
 
     now = int(_time.time())
+    completion_allowed, veto_policies, veto_codes = kb._evaluate_completion_vetoes(
+        conn,
+        root_id,
+        result=None,
+        summary=summary,
+        metadata=metadata,
+    )
+    if not completion_allowed:
+        kb._append_event(
+            conn,
+            root_id,
+            "completion_vetoed",
+            {"policies": veto_policies, "codes": veto_codes},
+        )
+        return False
     cur = conn.execute(
         """
         UPDATE tasks
@@ -141,8 +156,17 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    root_completion_vetoes: Optional[Iterable[str]] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    vetoes = kb._normalize_completion_vetoes(root_completion_vetoes)
+    if vetoes:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception:
+            pass
     activation_summary = (
         "Swarm topology planned; root remains the shared blackboard."
     )
@@ -163,6 +187,7 @@ def create_swarm(
             workspace_path=workspace_path,
             priority=priority,
             idempotency_key=idempotency_key,
+            root_completion_vetoes=vetoes,
         )
         root = kb.get_task(conn, created.root_id)
         if root is not None and root.status == "blocked":
@@ -212,6 +237,7 @@ def _create_swarm_uncommitted(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    root_completion_vetoes: Optional[Iterable[str]] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
@@ -247,6 +273,7 @@ def _create_swarm_uncommitted(
         initial_status="blocked",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        completion_vetoes=root_completion_vetoes,
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the

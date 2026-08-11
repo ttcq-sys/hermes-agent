@@ -101,6 +101,8 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+_COMPLETION_VETO_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
+_MAX_COMPLETION_VETOES = 8
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -993,6 +995,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Ordered policy names that must each affirm completion from
+    # ``kanban_completion_veto`` middleware inside the final write transaction.
+    completion_vetoes: Optional[list[str]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1006,6 +1011,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        completion_vetoes_value: Optional[list[str]] = None
+        if "completion_vetoes" in keys and row["completion_vetoes"]:
+            try:
+                parsed = json.loads(row["completion_vetoes"])
+                if isinstance(parsed, list):
+                    completion_vetoes_value = [str(v) for v in parsed if v]
+            except Exception:
+                completion_vetoes_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1087,6 +1100,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            completion_vetoes=completion_vetoes_value,
         )
 
 
@@ -1274,7 +1288,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional ordered completion-policy names. Every named policy must
+    -- affirm completion inside the same write transaction as the done CAS.
+    completion_vetoes    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2474,6 +2491,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "completion_vetoes" not in cols:
+        # Existing tasks remain unguarded unless their creator explicitly opts
+        # them into one or more named completion policies.
+        _add_column_if_missing(
+            conn, "tasks", "completion_vetoes", "completion_vetoes TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2912,6 +2936,28 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_completion_vetoes(
+    values: Optional[Iterable[str]],
+) -> list[str]:
+    """Validate and de-duplicate task-scoped completion policy names."""
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        raise ValueError("completion_vetoes must be an iterable of policy names")
+    normalized: list[str] = []
+    for raw in values:
+        name = str(raw or "").strip().lower()
+        if not _COMPLETION_VETO_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid completion veto policy name: {name!r}")
+        if name not in normalized:
+            normalized.append(name)
+        if len(normalized) > _MAX_COMPLETION_VETOES:
+            raise ValueError(
+                f"completion_vetoes supports at most {_MAX_COMPLETION_VETOES} policies"
+            )
+    return normalized
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2940,6 +2986,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    completion_vetoes: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2985,6 +3032,7 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    completion_vetoes_list = _normalize_completion_vetoes(completion_vetoes)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3157,12 +3205,27 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, completion_vetoes FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            raw_existing = row["completion_vetoes"]
+            try:
+                existing_vetoes = (
+                    []
+                    if raw_existing in (None, "")
+                    else _normalize_completion_vetoes(json.loads(raw_existing))
+                )
+            except Exception as exc:
+                raise ValueError(
+                    "idempotency completion_vetoes contract is invalid"
+                ) from exc
+            if existing_vetoes != completion_vetoes_list:
+                raise ValueError(
+                    "idempotency completion_vetoes contract mismatch"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3254,8 +3317,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_vetoes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3281,6 +3344,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (
+                            json.dumps(completion_vetoes_list)
+                            if completion_vetoes_list else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -3305,6 +3372,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "completion_vetoes": completion_vetoes_list or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -5066,6 +5134,145 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _safe_veto_code(value: object, fallback: str) -> str:
+    code = str(value or "").strip().lower()
+    if _COMPLETION_VETO_NAME_RE.fullmatch(code):
+        return code
+    return fallback
+
+
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Derive the canonical board slug from the connection's main DB path."""
+    try:
+        main = next(
+            row for row in conn.execute("PRAGMA database_list").fetchall()
+            if row[1] == "main"
+        )
+        db_path = Path(str(main[2])).resolve()
+        if db_path == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        relative = db_path.relative_to(boards_root().resolve())
+        if len(relative.parts) == 2 and relative.parts[1] == "kanban.db":
+            return _normalize_board_slug(relative.parts[0]) or DEFAULT_BOARD
+        pinned = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if pinned:
+            return _normalize_board_slug(pinned) or DEFAULT_BOARD
+    except Exception:
+        pass
+    return get_current_board()
+
+
+def _task_has_completion_veto_config(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True for any non-empty or malformed persisted veto contract."""
+    row = conn.execute(
+        "SELECT completion_vetoes FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    raw = row["completion_vetoes"] if row else None
+    return raw is not None and raw != ""
+
+
+def _evaluate_completion_vetoes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> tuple[bool, list[str], list[str]]:
+    """Evaluate every task-scoped completion policy under the write lock.
+
+    The policy list is a first-class immutable task field, not editable body
+    text.  Each named policy must receive at least one explicit ``allow`` and
+    no ``block`` decision from registered ``kanban_completion_veto``
+    middleware. Missing providers, callback failures, and malformed decisions
+    are fail-closed. Callbacks run synchronously in the caller's transaction;
+    they must use the supplied connection and perform only bounded local reads.
+    """
+    task = get_task(conn, task_id)
+    raw_row = conn.execute(
+        "SELECT completion_vetoes FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    raw_policies = raw_row["completion_vetoes"] if raw_row else None
+    if raw_policies is None or raw_policies == "":
+        return True, [], []
+    try:
+        parsed_policies = json.loads(raw_policies)
+        if not isinstance(parsed_policies, list):
+            raise ValueError("completion_vetoes must be a list")
+        policies = _normalize_completion_vetoes(parsed_policies)
+        if not policies:
+            raise ValueError("completion_vetoes must not be empty")
+    except Exception:
+        return False, ["invalid-completion-veto-config"], ["policy-config-invalid"]
+
+    try:
+        from hermes_cli.middleware import KANBAN_COMPLETION_VETO_MIDDLEWARE
+        from hermes_cli.plugins import get_plugin_manager
+
+        callbacks = list(
+            get_plugin_manager()._middleware.get(  # noqa: SLF001 - core registry seam
+                KANBAN_COMPLETION_VETO_MIDDLEWARE, []
+            )
+        )
+    except Exception:
+        callbacks = []
+
+    allowed: set[str] = set()
+    blocked: set[str] = set()
+    codes: set[str] = set()
+    callback_failed = False
+    response_invalid = False
+    for callback in callbacks:
+        try:
+            decision = callback(
+                connection=conn,
+                task=task,
+                task_id=task_id,
+                required_policies=tuple(policies),
+                result=result,
+                summary=summary,
+                metadata=metadata,
+                board=_board_for_connection(conn),
+                inside_write_transaction=True,
+            )
+        except Exception:
+            callback_failed = True
+            continue
+        if decision is None:
+            continue
+        decisions = decision if isinstance(decision, list) else [decision]
+        if not decisions:
+            response_invalid = True
+        for item in decisions:
+            if not isinstance(item, dict):
+                response_invalid = True
+                continue
+            policy = str(item.get("policy") or "").strip().lower()
+            if policy not in policies:
+                response_invalid = True
+                continue
+            action = str(item.get("decision") or "").strip().lower()
+            if action == "allow":
+                allowed.add(policy)
+            elif action == "block":
+                blocked.add(policy)
+                codes.add(_safe_veto_code(item.get("code"), "policy-blocked"))
+            else:
+                response_invalid = True
+
+    if callback_failed:
+        codes.add("provider-error")
+    if response_invalid:
+        codes.add("provider-response-invalid")
+    missing = set(policies) - allowed
+    if missing:
+        codes.add("provider-missing-or-no-allow")
+    vetoed = bool(blocked or missing or callback_failed or response_invalid)
+    return not vetoed, policies, sorted(codes)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5145,6 +5352,17 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Plugin discovery may import modules and touch configuration. Do it before
+    # the SQLite write lock, but only for tasks that carry a persisted guard
+    # contract. A discovery failure remains fail-closed in the evaluator below
+    # as a missing provider and is recorded atomically with the denied attempt.
+    if _task_has_completion_veto_config(conn, task_id):
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception:
+            pass
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5152,10 +5370,31 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        if prior_status not in {"running", "ready", "blocked", "review"}:
+            return False
+        if expected_run_id is not None and (
+            prior is None or prior["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+        completion_allowed, veto_policies, veto_codes = _evaluate_completion_vetoes(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+        if not completion_allowed:
+            _append_event(
+                conn,
+                task_id,
+                "completion_vetoed",
+                {"policies": veto_policies, "codes": veto_codes},
+            )
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -7184,6 +7423,25 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        # ``archived`` satisfies parent dependencies just like ``done``. A
+        # guarded task therefore cannot use archive as a receipt-free terminal
+        # bypass; it must complete through the canonical veto first.
+        if (
+            task
+            and _task_has_completion_veto_config(conn, task_id)
+            and task.status != "done"
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "completion_vetoed",
+                {
+                    "policies": list(task.completion_vetoes or ["invalid-completion-veto-config"]),
+                    "codes": ["archive-requires-completion"],
+                },
+            )
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7245,6 +7503,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task and _task_has_completion_veto_config(conn, task_id):
+            # Guarded task history is removed only through the explicit
+            # archive-then-delete path, after canonical completion succeeded.
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
