@@ -78,6 +78,44 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_stale_run_cannot_retype_blocked_human_wait(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        stale_run_id = kb.get_task(conn, tid).current_run_id
+        assert stale_run_id is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="needs owner input",
+            kind="needs_input",
+            expected_run_id=stale_run_id,
+        )
+
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        current_run_id = kb.get_task(conn, tid).current_run_id
+        assert current_run_id is not None
+        assert current_run_id != stale_run_id
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="missing capability",
+            kind="capability",
+            expected_run_id=current_run_id,
+        )
+
+        assert not kb.block_task(
+            conn,
+            tid,
+            reason="stale worker overwrite",
+            kind="needs_input",
+            expected_run_id=stale_run_id,
+        )
+        blocked = kb.get_task(conn, tid)
+        assert blocked.status == "blocked"
+        assert blocked.block_kind == "capability"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
@@ -108,5 +146,4 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
 

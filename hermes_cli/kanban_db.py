@@ -5925,7 +5925,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -5946,6 +5947,11 @@ def block_task(
         if cur_row["status"] == "blocked":
             human_kinds = {"needs_input", "capability"}
             if kind not in human_kinds or prev_kind not in human_kinds:
+                return False
+            if (
+                expected_run_id is not None
+                and cur_row["current_run_id"] != int(expected_run_id)
+            ):
                 return False
             if kind == prev_kind:
                 return True

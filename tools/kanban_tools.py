@@ -674,6 +674,17 @@ _TTC_KNOWLEDGE_ROUTE_KEYS = {
 }
 _TTC_TASK_ID_RE = re.compile(r"^t_[a-f0-9]{8,}$")
 _TTC_TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+_TTC_KNOWLEDGE_UNSUCCESSFUL_RUN_OUTCOMES = {
+    "crashed",
+    "failed",
+    "gave_up",
+    "queued",
+    "rate_limited",
+    "reclaimed",
+    "spawn_failed",
+    "stale",
+    "timed_out",
+}
 
 
 def _ttc_yes(value: Any) -> bool:
@@ -843,7 +854,7 @@ def _validate_ttc_knowledge_completion(
     child_blocked = knowledge_task.status == "blocked"
     child_failed = (
         knowledge_task.status in {"failed", "cancelled"}
-        or latest_outcome in {"failed", "timed_out", "queued"}
+        or latest_outcome in _TTC_KNOWLEDGE_UNSUCCESSFUL_RUN_OUTCOMES
     )
     if child_blocked:
         if disposition_status != "blocked":
@@ -859,10 +870,15 @@ def _validate_ttc_knowledge_completion(
         disposition_status == "candidate-routed" or handoff_status == "delivered"
     ):
         return "failed, timed-out, or queued Knowledge work cannot be claimed delivered"
-    if handoff_status in {"reviewing", "completed"} and (
+    if handoff_status == "completed" and knowledge_task.status not in {
+        "done",
+        "archived",
+    }:
+        return "handoff_status completed requires completed Knowledge work"
+    if handoff_status == "reviewing" and (
         child_failed or knowledge_task.status in {"todo", "ready", "blocked"}
     ):
-        return "queued, timed-out, or failed Knowledge work cannot be called reviewing/completed"
+        return "queued, timed-out, or failed Knowledge work cannot be called reviewing"
     return None
 
 
