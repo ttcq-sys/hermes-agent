@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -176,13 +177,16 @@ def test_malformed_persisted_policy_is_fail_closed(kanban_home):
         assert kb.delete_task(conn, task_id) is False
 
 
-def test_empty_persisted_policy_contract_is_fail_closed(kanban_home):
+@pytest.mark.parametrize("raw_contract", ["", "[]"])
+def test_empty_persisted_policy_contract_is_fail_closed(
+    kanban_home, raw_contract
+):
     with kb.connect_closing() as conn:
         task_id = _guarded_task(conn)
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET completion_vetoes = '[]' WHERE id = ?",
-                (task_id,),
+                "UPDATE tasks SET completion_vetoes = ? WHERE id = ?",
+                (raw_contract, task_id),
             )
         assert kb.complete_task(conn, task_id) is False
         event = kb.list_events(conn, task_id)[-1]
@@ -192,6 +196,64 @@ def test_empty_persisted_policy_contract_is_fail_closed(kanban_home):
         }
         assert kb.archive_task(conn, task_id) is False
         assert kb.delete_task(conn, task_id) is False
+
+
+def test_failed_plugin_registration_rolls_back_veto_callback(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+
+    plugin_dir = kanban_home / "plugins" / "broken_veto_provider"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: broken_veto_provider\nversion: 0.1.0\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def _allow(**kwargs):\n"
+        f"    return {{'policy': '{POLICY}', 'decision': 'allow'}}\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_middleware('kanban_completion_veto', _allow)\n"
+        "    raise RuntimeError('registration failed')\n",
+        encoding="utf-8",
+    )
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - broken_veto_provider\n",
+        encoding="utf-8",
+    )
+    fresh_manager = plugins_module.PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", fresh_manager)
+    middleware_staged = threading.Event()
+    registration_can_fail = threading.Event()
+    original_register_middleware = plugins_module.PluginContext.register_middleware
+
+    def pause_after_registration(context, kind, callback):
+        original_register_middleware(context, kind, callback)
+        if context.manifest.name == "broken_veto_provider":
+            middleware_staged.set()
+            assert registration_can_fail.wait(timeout=10)
+
+    monkeypatch.setattr(
+        plugins_module.PluginContext,
+        "register_middleware",
+        pause_after_registration,
+    )
+    discovery = threading.Thread(target=fresh_manager.discover_and_load)
+    discovery.start()
+    assert middleware_staged.wait(timeout=10)
+
+    with kb.connect_closing() as conn:
+        task_id = _guarded_task(conn)
+        assert kb.complete_task(conn, task_id) is False
+        event = kb.list_events(conn, task_id)[-1]
+        assert "provider-missing-or-no-allow" in event.payload["codes"]
+
+    registration_can_fail.set()
+    discovery.join(timeout=10)
+    assert not discovery.is_alive()
+    assert fresh_manager._plugins["broken_veto_provider"].enabled is False
+    assert fresh_manager._plugins["broken_veto_provider"].error
+    assert fresh_manager._middleware.get(KANBAN_COMPLETION_VETO_MIDDLEWARE, []) == []
 
 
 def test_allow_decision_and_status_cas_share_one_transaction(

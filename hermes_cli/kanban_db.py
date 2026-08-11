@@ -5165,12 +5165,12 @@ def _board_for_connection(conn: sqlite3.Connection) -> str:
 def _task_has_completion_veto_config(
     conn: sqlite3.Connection, task_id: str
 ) -> bool:
-    """Return True for any non-empty or malformed persisted veto contract."""
+    """Return True for any persisted veto contract, including malformed ones."""
     row = conn.execute(
         "SELECT completion_vetoes FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     raw = row["completion_vetoes"] if row else None
-    return raw is not None and raw != ""
+    return raw is not None
 
 
 def _evaluate_completion_vetoes(
@@ -5195,7 +5195,7 @@ def _evaluate_completion_vetoes(
         "SELECT completion_vetoes FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     raw_policies = raw_row["completion_vetoes"] if raw_row else None
-    if raw_policies is None or raw_policies == "":
+    if raw_policies is None:
         return True, [], []
     try:
         parsed_policies = json.loads(raw_policies)
