@@ -78,6 +78,7 @@ def _activate_root_inline(
     conn: sqlite3.Connection,
     root_id: str,
     *,
+    completion_veto_callbacks: Iterable[Any],
     summary: str,
     metadata: dict[str, Any],
 ) -> bool:
@@ -96,6 +97,7 @@ def _activate_root_inline(
     completion_allowed, veto_policies, veto_codes = kb._evaluate_completion_vetoes(
         conn,
         root_id,
+        callbacks=completion_veto_callbacks,
         result=None,
         summary=summary,
         metadata=metadata,
@@ -160,13 +162,18 @@ def create_swarm(
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
     vetoes = kb._normalize_completion_vetoes(root_completion_vetoes)
+    completion_veto_callbacks: tuple[Any, ...] = ()
     if vetoes:
         try:
-            from hermes_cli.plugins import discover_plugins
+            from hermes_cli.middleware import KANBAN_COMPLETION_VETO_MIDDLEWARE
+            from hermes_cli.plugins import get_middleware_snapshot
 
-            discover_plugins()
+            completion_veto_callbacks = get_middleware_snapshot(
+                KANBAN_COMPLETION_VETO_MIDDLEWARE,
+                discover=True,
+            )
         except Exception:
-            pass
+            completion_veto_callbacks = ()
     activation_summary = (
         "Swarm topology planned; root remains the shared blackboard."
     )
@@ -194,6 +201,7 @@ def create_swarm(
             if not _activate_root_inline(
                 conn,
                 created.root_id,
+                completion_veto_callbacks=completion_veto_callbacks,
                 summary=activation_summary,
                 metadata={
                     "kind": "kanban_swarm_v1",

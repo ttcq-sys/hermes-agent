@@ -359,6 +359,93 @@ def test_completion_waits_for_the_entire_plugin_discovery_sweep(
     ) == 2
 
 
+def test_completion_uses_snapshot_across_concurrent_forced_rediscovery(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+
+    for name, decision in (
+        ("aaa_allow_veto_provider", "allow"),
+        ("zzz_block_veto_provider", "block"),
+    ):
+        plugin_dir = kanban_home / "plugins" / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {name}\nversion: 0.1.0\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def _decision(**kwargs):\n"
+            f"    return {{'policy': '{POLICY}', 'decision': '{decision}'}}\n\n"
+            "def register(ctx):\n"
+            "    ctx.register_middleware('kanban_completion_veto', _decision)\n",
+            encoding="utf-8",
+        )
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - aaa_allow_veto_provider\n"
+        "    - zzz_block_veto_provider\n",
+        encoding="utf-8",
+    )
+    fresh_manager = plugins_module.PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", fresh_manager)
+    fresh_manager.discover_and_load()
+    with kb.connect_closing() as conn:
+        task_id = _guarded_task(conn)
+
+    evaluation_waiting = threading.Event()
+    evaluation_can_continue = threading.Event()
+    blocker_staged = threading.Event()
+    rediscovery_can_finish = threading.Event()
+    result = {}
+    original_evaluate = kb._evaluate_completion_vetoes
+    original_register_middleware = plugins_module.PluginContext.register_middleware
+
+    def pause_before_evaluation(*args, **kwargs):
+        evaluation_waiting.set()
+        assert evaluation_can_continue.wait(timeout=10)
+        return original_evaluate(*args, **kwargs)
+
+    def pause_forced_block_provider(context, kind, callback):
+        original_register_middleware(context, kind, callback)
+        if (
+            context.manifest.name == "zzz_block_veto_provider"
+            and threading.current_thread().name == "forced-rediscovery"
+        ):
+            blocker_staged.set()
+            assert rediscovery_can_finish.wait(timeout=10)
+
+    monkeypatch.setattr(kb, "_evaluate_completion_vetoes", pause_before_evaluation)
+    monkeypatch.setattr(
+        plugins_module.PluginContext,
+        "register_middleware",
+        pause_forced_block_provider,
+    )
+
+    def complete_in_parallel():
+        with kb.connect_closing() as conn:
+            result["allowed"] = kb.complete_task(conn, task_id)
+
+    completion = threading.Thread(target=complete_in_parallel)
+    completion.start()
+    assert evaluation_waiting.wait(timeout=10)
+    rediscovery = threading.Thread(
+        target=lambda: fresh_manager.discover_and_load(force=True),
+        name="forced-rediscovery",
+    )
+    rediscovery.start()
+    assert blocker_staged.wait(timeout=10)
+    evaluation_can_continue.set()
+    completion.join(timeout=10)
+    rediscovery_can_finish.set()
+    rediscovery.join(timeout=10)
+
+    assert not completion.is_alive()
+    assert not rediscovery.is_alive()
+    assert result["allowed"] is False
+
+
 def test_allow_decision_and_status_cas_share_one_transaction(
     kanban_home, isolated_completion_middleware
 ):

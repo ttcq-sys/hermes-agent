@@ -5180,6 +5180,7 @@ def _evaluate_completion_vetoes(
     conn: sqlite3.Connection,
     task_id: str,
     *,
+    callbacks: Iterable[Any],
     result: Optional[str],
     summary: Optional[str],
     metadata: Optional[dict],
@@ -5210,17 +5211,7 @@ def _evaluate_completion_vetoes(
     except Exception:
         return False, ["invalid-completion-veto-config"], ["policy-config-invalid"]
 
-    try:
-        from hermes_cli.middleware import KANBAN_COMPLETION_VETO_MIDDLEWARE
-        from hermes_cli.plugins import get_plugin_manager
-
-        callbacks = list(
-            get_plugin_manager()._middleware.get(  # noqa: SLF001 - core registry seam
-                KANBAN_COMPLETION_VETO_MIDDLEWARE, []
-            )
-        )
-    except Exception:
-        callbacks = []
+    callbacks = list(callbacks)
 
     allowed: set[str] = set()
     blocked: set[str] = set()
@@ -5355,17 +5346,21 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    # Plugin discovery may import modules and touch configuration. Do it before
-    # the SQLite write lock, but only for tasks that carry a persisted guard
-    # contract. A discovery failure remains fail-closed in the evaluator below
-    # as a missing provider and is recorded atomically with the denied attempt.
+    # Plugin discovery may import modules and touch configuration. Capture one
+    # immutable callback generation before the SQLite write lock so concurrent
+    # forced rediscovery cannot expose a partially published provider set.
+    completion_veto_callbacks: tuple[Any, ...] = ()
     if _task_has_completion_veto_config(conn, task_id):
         try:
-            from hermes_cli.plugins import discover_plugins
+            from hermes_cli.middleware import KANBAN_COMPLETION_VETO_MIDDLEWARE
+            from hermes_cli.plugins import get_middleware_snapshot
 
-            discover_plugins()
+            completion_veto_callbacks = get_middleware_snapshot(
+                KANBAN_COMPLETION_VETO_MIDDLEWARE,
+                discover=True,
+            )
         except Exception:
-            pass
+            completion_veto_callbacks = ()
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5386,6 +5381,7 @@ def complete_task(
         completion_allowed, veto_policies, veto_codes = _evaluate_completion_vetoes(
             conn,
             task_id,
+            callbacks=completion_veto_callbacks,
             result=result,
             summary=summary,
             metadata=metadata,
