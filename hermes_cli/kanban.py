@@ -15,6 +15,8 @@ Exposes the full Kanban command surface documented in the design spec
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import json
 import os
@@ -566,7 +568,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
-    p_comment.add_argument("text", nargs="+", help="Comment body")
+    p_comment.add_argument("text", nargs="*", help="Comment body")
+    p_comment.add_argument(
+        "--body-b64",
+        default=None,
+        help="Strict UTF-8 comment body encoded as Base64 (cannot be combined with text)",
+    )
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
@@ -2085,7 +2092,22 @@ def _cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
-    body = " ".join(args.text).strip()
+    if args.body_b64 is not None:
+        if args.text:
+            print("kanban: --body-b64 cannot be combined with text", file=sys.stderr)
+            return 2
+        try:
+            body = base64.b64decode(args.body_b64, validate=True).decode(
+                "utf-8", errors="strict"
+            )
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            print("kanban: --body-b64 must be strict UTF-8 Base64", file=sys.stderr)
+            return 2
+    else:
+        body = " ".join(args.text)
+    if not body.strip():
+        print("kanban: comment body must not be empty", file=sys.stderr)
+        return 2
     if args.max_len is not None:
         if args.max_len < 1:
             print("kanban: --max-len must be positive", file=sys.stderr)
