@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -118,3 +119,48 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rewrite_can_clear_inherited_context_before_agent_dispatch(monkeypatch):
+    """A privacy hook can retain the current text without leaking backfill."""
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "rewrite",
+                    "text": "privacy-safe current message",
+                    "clear_inherited_context": True,
+                }
+            ]
+        return []
+
+    captured = {}
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        captured["event"] = event
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    event = dataclasses.replace(
+        _make_event("current message"),
+        channel_context="private channel history",
+        reply_to_message_id="m0",
+        reply_to_text="private parent message",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    dispatched = captured["event"]
+    assert dispatched.text == "privacy-safe current message"
+    assert dispatched.channel_context is None
+    assert dispatched.reply_to_text is None
+    assert dispatched.reply_to_message_id is None
+    assert dispatched.reply_to_author_id is None
+    assert dispatched.reply_to_author_name is None
+    assert dispatched.reply_to_is_own_message is False
