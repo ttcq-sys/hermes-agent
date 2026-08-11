@@ -371,6 +371,7 @@ class PluginContext:
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
+        self._pending_middleware: Optional[Dict[str, List[Callable]]] = None
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -1246,8 +1247,25 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        target = (
+            self._pending_middleware
+            if self._pending_middleware is not None
+            else self._manager._middleware
+        )
+        target.setdefault(kind, []).append(callback)
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
+
+    def _begin_middleware_registration(self) -> None:
+        """Stage middleware until the plugin's register call fully succeeds."""
+        self._pending_middleware = {}
+
+    def _publish_middleware_registration(self) -> None:
+        """Atomically publish each successfully registered middleware kind."""
+        pending = self._pending_middleware or {}
+        self._pending_middleware = None
+        for kind, callbacks in pending.items():
+            existing = self._manager._middleware.get(kind, [])
+            self._manager._middleware[kind] = [*existing, *callbacks]
 
     # -- skill registration -------------------------------------------------
 
@@ -1948,7 +1966,9 @@ class PluginManager:
                 _mw_counts_before = {
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
+                ctx._begin_middleware_registration()
                 register_fn(ctx)
+                ctx._publish_middleware_registration()
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
