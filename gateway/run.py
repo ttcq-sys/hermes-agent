@@ -14859,6 +14859,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #      Optional clear_inherited_context=True also removes reply/backfill
+        #      fields before any prompt or session processing.
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -14893,7 +14895,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
+                        _replacement = {"text": _new_text}
+                        if _result.get("clear_inherited_context") is True:
+                            _replacement.update(
+                                {
+                                    "channel_context": None,
+                                    "reply_to_message_id": None,
+                                    "reply_to_text": None,
+                                    "reply_to_author_id": None,
+                                    "reply_to_author_name": None,
+                                    "reply_to_is_own_message": False,
+                                }
+                            )
+                        event = dataclasses.replace(event, **_replacement)
                         source = event.source
                     break
                 if _action == "allow":
