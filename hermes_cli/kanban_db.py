@@ -3213,11 +3213,14 @@ def create_task(
         if row:
             raw_existing = row["completion_vetoes"]
             try:
-                existing_vetoes = (
-                    []
-                    if raw_existing in (None, "")
-                    else _normalize_completion_vetoes(json.loads(raw_existing))
-                )
+                if raw_existing is None:
+                    existing_vetoes = []
+                else:
+                    existing_vetoes = _normalize_completion_vetoes(
+                        json.loads(raw_existing)
+                    )
+                    if not existing_vetoes:
+                        raise ValueError("empty persisted veto contract")
             except Exception as exc:
                 raise ValueError(
                     "idempotency completion_vetoes contract is invalid"
