@@ -2171,6 +2171,15 @@ class PluginManager:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
 
+    def middleware_snapshot(
+        self, kind: str, *, discover: bool = False
+    ) -> tuple[Callable, ...]:
+        """Return an immutable callback snapshot outside any partial sweep."""
+        with self._discovery_lock:
+            if discover:
+                self._discover_and_load_serialized()
+            return tuple(self._middleware.get(kind, ()))
+
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call registered middleware callbacks for *kind*.
 
@@ -2319,6 +2328,13 @@ def discover_plugins(force: bool = False) -> None:
     """
     _join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
+
+
+def get_middleware_snapshot(
+    kind: str, *, discover: bool = False
+) -> tuple[Callable, ...]:
+    """Return callbacks from one fully published discovery generation."""
+    return get_plugin_manager().middleware_snapshot(kind, discover=discover)
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
