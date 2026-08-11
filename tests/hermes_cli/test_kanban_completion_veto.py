@@ -446,6 +446,61 @@ def test_completion_uses_snapshot_across_concurrent_forced_rediscovery(
     assert result["allowed"] is False
 
 
+def test_reentrant_completion_during_discovery_is_fail_closed(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+
+    for name, decision in (
+        ("aaa_allow_veto_provider", "allow"),
+        ("zzz_block_veto_provider", "block"),
+    ):
+        plugin_dir = kanban_home / "plugins" / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {name}\nversion: 0.1.0\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def _decision(**kwargs):\n"
+            f"    return {{'policy': '{POLICY}', 'decision': '{decision}'}}\n\n"
+            "def register(ctx):\n"
+            "    ctx.register_middleware('kanban_completion_veto', _decision)\n",
+            encoding="utf-8",
+        )
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - aaa_allow_veto_provider\n"
+        "    - zzz_block_veto_provider\n",
+        encoding="utf-8",
+    )
+    with kb.connect_closing() as conn:
+        task_id = _guarded_task(conn)
+    fresh_manager = plugins_module.PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", fresh_manager)
+    result = {}
+    original_register_middleware = plugins_module.PluginContext.register_middleware
+
+    def complete_before_late_block_registration(context, kind, callback):
+        if context.manifest.name == "zzz_block_veto_provider":
+            with kb.connect_closing() as conn:
+                result["allowed"] = kb.complete_task(conn, task_id)
+        original_register_middleware(context, kind, callback)
+
+    monkeypatch.setattr(
+        plugins_module.PluginContext,
+        "register_middleware",
+        complete_before_late_block_registration,
+    )
+    fresh_manager.discover_and_load()
+
+    assert result["allowed"] is False
+    assert len(
+        fresh_manager._middleware[KANBAN_COMPLETION_VETO_MIDDLEWARE]
+    ) == 2
+
+
 def test_allow_decision_and_status_cas_share_one_transaction(
     kanban_home, isolated_completion_middleware
 ):
