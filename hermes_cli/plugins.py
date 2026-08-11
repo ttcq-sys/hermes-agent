@@ -1337,6 +1337,7 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        self._discovery_lock = threading.RLock()
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1363,6 +1364,11 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
+        with self._discovery_lock:
+            self._discover_and_load_serialized(force=force)
+
+    def _discover_and_load_serialized(self, force: bool = False) -> None:
+        """Run one discovery sweep while every concurrent caller waits."""
         if self._discovered and not force:
             return
         if env_var_enabled("HERMES_SAFE_MODE"):

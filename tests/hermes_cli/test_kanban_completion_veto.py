@@ -92,6 +92,31 @@ def test_idempotent_guard_contract_mismatch_is_rejected(kanban_home):
         assert kb.get_task(conn, existing_id).completion_vetoes is None
 
 
+@pytest.mark.parametrize("raw_contract", ["", "[]"])
+def test_idempotent_empty_persisted_contract_is_invalid(
+    kanban_home, raw_contract
+):
+    with kb.connect_closing() as conn:
+        existing_id = kb.create_task(
+            conn,
+            title="corrupted idempotent task",
+            idempotency_key="corrupted-request",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completion_vetoes = ? WHERE id = ?",
+                (raw_contract, existing_id),
+            )
+        with pytest.raises(
+            ValueError, match="idempotency completion_vetoes contract is invalid"
+        ):
+            kb.create_task(
+                conn,
+                title="unguarded retry",
+                idempotency_key="corrupted-request",
+            )
+
+
 def test_guarded_task_fails_closed_without_provider_and_audits_attempt(kanban_home):
     with kb.connect_closing() as conn:
         task_id = _guarded_task(conn)
@@ -254,6 +279,84 @@ def test_failed_plugin_registration_rolls_back_veto_callback(
     assert fresh_manager._plugins["broken_veto_provider"].enabled is False
     assert fresh_manager._plugins["broken_veto_provider"].error
     assert fresh_manager._middleware.get(KANBAN_COMPLETION_VETO_MIDDLEWARE, []) == []
+
+
+def test_completion_waits_for_the_entire_plugin_discovery_sweep(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import plugins as plugins_module
+
+    for name, decision in (
+        ("aaa_allow_veto_provider", "allow"),
+        ("zzz_block_veto_provider", "block"),
+    ):
+        plugin_dir = kanban_home / "plugins" / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {name}\nversion: 0.1.0\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def _decision(**kwargs):\n"
+            f"    return {{'policy': '{POLICY}', 'decision': '{decision}'}}\n\n"
+            "def register(ctx):\n"
+            "    ctx.register_middleware('kanban_completion_veto', _decision)\n",
+            encoding="utf-8",
+        )
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - aaa_allow_veto_provider\n"
+        "    - zzz_block_veto_provider\n",
+        encoding="utf-8",
+    )
+    fresh_manager = plugins_module.PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", fresh_manager)
+    blocker_staged = threading.Event()
+    discovery_can_finish = threading.Event()
+    completion_started = threading.Event()
+    completion_finished = threading.Event()
+    result = {}
+    original_register_middleware = plugins_module.PluginContext.register_middleware
+
+    def pause_second_provider(context, kind, callback):
+        original_register_middleware(context, kind, callback)
+        if context.manifest.name == "zzz_block_veto_provider":
+            blocker_staged.set()
+            assert discovery_can_finish.wait(timeout=10)
+
+    monkeypatch.setattr(
+        plugins_module.PluginContext,
+        "register_middleware",
+        pause_second_provider,
+    )
+    with kb.connect_closing() as conn:
+        task_id = _guarded_task(conn)
+
+    discovery = threading.Thread(target=fresh_manager.discover_and_load)
+    discovery.start()
+    assert blocker_staged.wait(timeout=10)
+
+    def complete_in_parallel():
+        completion_started.set()
+        with kb.connect_closing() as conn:
+            result["allowed"] = kb.complete_task(conn, task_id)
+        completion_finished.set()
+
+    completion = threading.Thread(target=complete_in_parallel)
+    completion.start()
+    assert completion_started.wait(timeout=10)
+    completion_finished.wait(timeout=2)
+    discovery_can_finish.set()
+    discovery.join(timeout=10)
+    completion.join(timeout=10)
+
+    assert not discovery.is_alive()
+    assert not completion.is_alive()
+    assert result["allowed"] is False
+    assert len(
+        fresh_manager._middleware[KANBAN_COMPLETION_VETO_MIDDLEWARE]
+    ) == 2
 
 
 def test_allow_decision_and_status_cas_share_one_transaction(
