@@ -93,6 +93,21 @@ def _activate_root_inline(
     import time as _time
 
     now = int(_time.time())
+    completion_allowed, veto_policies, veto_codes = kb._evaluate_completion_vetoes(
+        conn,
+        root_id,
+        result=None,
+        summary=summary,
+        metadata=metadata,
+    )
+    if not completion_allowed:
+        kb._append_event(
+            conn,
+            root_id,
+            "completion_vetoed",
+            {"policies": veto_policies, "codes": veto_codes},
+        )
+        return False
     cur = conn.execute(
         """
         UPDATE tasks
