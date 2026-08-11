@@ -1299,6 +1299,109 @@ def test_ttc_completion_rejects_running_child_claimed_as_completed(
         assert kb.get_task(conn, worker_env).status == "running"
 
 
+def test_ttc_completion_rejects_unfinished_archived_child_as_completed(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff archived before work",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        assert kb.archive_task(conn, child_id)
+        assert kb.get_task(conn, child_id).status == "archived"
+        assert kb.latest_run(conn, child_id) is None
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="completed",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading archived completion",
+        "metadata": misleading,
+    }))
+    assert "completed" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_accepts_archived_child_with_completed_run(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff completed before archive",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, child_id, claimer="knowledge-worker") is not None
+        assert kb.complete_task(conn, child_id, result="Knowledge review complete")
+        assert kb.archive_task(conn, child_id)
+        assert kb.get_task(conn, child_id).status == "archived"
+        assert kb.latest_run(conn, child_id).outcome == "completed"
+
+    receipt = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="completed",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    accepted = json.loads(kt._handle_complete({
+        "summary": "truthful archived completion",
+        "metadata": receipt,
+    }))
+    assert accepted.get("ok") is True
+
+
+def test_ttc_completion_rejects_triage_child_claimed_as_reviewing(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff still in triage",
+        "assignee": "knowledge-steward",
+        "triage": True,
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_id).status == "triage"
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="reviewing",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading review handoff",
+        "metadata": misleading,
+    }))
+    assert "reviewing" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
 def test_ttc_blocked_knowledge_child_requires_truthful_blocked_receipt(
     monkeypatch, worker_env
 ):

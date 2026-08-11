@@ -852,9 +852,13 @@ def _validate_ttc_knowledge_completion(
     latest = kb.latest_run(conn, knowledge_task.id)
     latest_outcome = str(latest.outcome or "").strip().lower() if latest else ""
     child_blocked = knowledge_task.status == "blocked"
+    child_completed = knowledge_task.status == "done" or (
+        knowledge_task.status == "archived" and latest_outcome == "completed"
+    )
     child_failed = (
         knowledge_task.status in {"failed", "cancelled"}
         or latest_outcome in _TTC_KNOWLEDGE_UNSUCCESSFUL_RUN_OUTCOMES
+        or (knowledge_task.status == "archived" and not child_completed)
     )
     if child_blocked:
         if disposition_status != "blocked":
@@ -866,19 +870,17 @@ def _validate_ttc_knowledge_completion(
             return "a blocked Knowledge child requires handoff_status blocked when present"
     elif disposition_status == "blocked":
         return "wiki_disposition.status blocked requires a blocked Knowledge child"
+    if handoff_status == "completed" and not child_completed:
+        return "handoff_status completed requires completed Knowledge work"
     if child_failed and (
         disposition_status == "candidate-routed" or handoff_status == "delivered"
     ):
         return "failed, timed-out, or queued Knowledge work cannot be claimed delivered"
-    if handoff_status == "completed" and knowledge_task.status not in {
-        "done",
-        "archived",
+    if handoff_status == "reviewing" and knowledge_task.status not in {
+        "running",
+        "review",
     }:
-        return "handoff_status completed requires completed Knowledge work"
-    if handoff_status == "reviewing" and (
-        child_failed or knowledge_task.status in {"todo", "ready", "blocked"}
-    ):
-        return "queued, timed-out, or failed Knowledge work cannot be called reviewing"
+        return "handoff_status reviewing requires active Knowledge review work"
     return None
 
 
