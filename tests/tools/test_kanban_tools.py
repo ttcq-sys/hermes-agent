@@ -523,6 +523,115 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_ttc_wiki_lifecycle_gate_rejects_incomplete_receipt(monkeypatch):
+    """TTC workers must not close substantive work without Wiki lifecycle evidence."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    error = kt._validate_ttc_wiki_lifecycle_metadata(
+        {"clinic_id": "tatoa-yongin", "profile": "coo"}
+    )
+
+    assert error is not None
+    assert "wiki_disposition" in error
+    assert "reference_receipt" in error
+    assert "practice_candidate" in error
+
+
+def test_complete_keeps_task_running_when_ttc_wiki_receipt_is_incomplete(
+    monkeypatch, worker_env
+):
+    """The TTC lifecycle validator must guard the real completion path."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    output = kt._handle_complete({
+        "summary": "work finished without a Wiki lifecycle receipt",
+        "metadata": {"clinic_id": "tatoa-yongin", "profile": "coo"},
+    })
+    error = json.loads(output).get("error", "")
+
+    assert "TTC Wiki lifecycle gate" in error
+    assert "still in-flight" in error
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_wiki_lifecycle_gate_accepts_complete_no_candidate_receipt(monkeypatch):
+    """A complete artifact-free no-change receipt remains valid."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    metadata = {
+        "clinic_id": "tatoa-yongin",
+        "profile": "source-steward",
+        "result": "no-change",
+        "artifacts": [],
+        "wiki_candidate": "no",
+        "wiki_candidate_reason": "No durable source claim changed.",
+        "wiki_disposition": {
+            "status": "none",
+            "reason": "No durable source claim changed.",
+        },
+        "handoff_to": ["coo"],
+        "handoff_evidence": ["kanban:t_example"],
+        "reference_receipt": {
+            "wiki_head": "a" * 40,
+            "practice_body_emitted": True,
+            "index": "tatoa-yongin-wiki/index.md",
+            "recent_log_entries": 3,
+            "relevant_docs": [],
+            "as_of": "2026-08-11T12:00:00+09:00",
+            "gaps": [],
+        },
+        "practice_candidate": {
+            "result": "no",
+            "reason": "Routine no-change work added no reusable method.",
+        },
+    }
+
+    assert kt._validate_ttc_wiki_lifecycle_metadata(metadata) is None
+
+
+def test_ttc_wiki_lifecycle_gate_requires_knowledge_route_for_candidate(monkeypatch):
+    """A specialist cannot claim a Wiki candidate without a durable Knowledge handoff."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    metadata = {
+        "clinic_id": "tatoa-yongin",
+        "profile": "operations-steward",
+        "result": "changed",
+        "artifacts": [],
+        "wiki_candidate": "yes",
+        "wiki_candidate_reason": "A reusable operating rule changed.",
+        "wiki_disposition": {
+            "status": "candidate-routed",
+            "reason": "A reusable operating rule changed.",
+        },
+        "handoff_to": ["coo"],
+        "handoff_evidence": ["kanban:t_example"],
+        "reference_receipt": {
+            "wiki_head": "a" * 40,
+            "practice_body_emitted": True,
+            "index": "tatoa-yongin-wiki/index.md",
+            "recent_log_entries": 3,
+            "relevant_docs": [],
+            "as_of": "2026-08-11T12:00:00+09:00",
+            "gaps": [],
+        },
+        "practice_candidate": {
+            "result": "no",
+            "reason": "No profile-specific method changed.",
+        },
+    }
+
+    error = kt._validate_ttc_wiki_lifecycle_metadata(metadata)
+    assert error is not None
+    assert "knowledge-steward" in error
+
+
 def test_complete_phantom_card_message_advertises_retry(worker_env):
     """A phantom-card rejection must surface a tool_error that explicitly
     tells the worker the task is still in-flight and how to retry — the

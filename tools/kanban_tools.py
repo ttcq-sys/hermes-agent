@@ -501,6 +501,146 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+_TTC_WIKI_DISPOSITION_STATUSES = {
+    "none",
+    "candidate-routed",
+    "approval-pending",
+    "draft-pr",
+    "saved",
+    "blocked",
+}
+
+
+def _ttc_yes(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _ttc_handoff_targets(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip().lower() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip().lower()
+    return [text] if text else []
+
+
+def _validate_ttc_wiki_lifecycle_metadata(metadata: Any) -> str | None:
+    """Return a fail-closed TTC Wiki lifecycle error, or ``None``.
+
+    The gate is opt-in so upstream Hermes boards are unaffected. The TTC
+    launcher enables it for every local Yongin profile and worker.
+    """
+    if os.environ.get("TTC_WIKI_LIFECYCLE_REQUIRED") != "1":
+        return None
+    if not isinstance(metadata, dict):
+        return (
+            "metadata must be an object containing clinic_id, profile, result, "
+            "artifacts, wiki_candidate, wiki_candidate_reason, wiki_disposition, "
+            "handoff_to, handoff_evidence, reference_receipt, and practice_candidate"
+        )
+
+    required = (
+        "clinic_id",
+        "profile",
+        "result",
+        "artifacts",
+        "wiki_candidate",
+        "wiki_candidate_reason",
+        "wiki_disposition",
+        "handoff_to",
+        "handoff_evidence",
+        "reference_receipt",
+        "practice_candidate",
+    )
+    missing = [key for key in required if key not in metadata]
+    if missing:
+        return "missing required fields: " + ", ".join(missing)
+    if metadata.get("clinic_id") != "tatoa-yongin":
+        return "clinic_id must be tatoa-yongin"
+    if not str(metadata.get("profile") or "").strip():
+        return "profile must be non-empty"
+    if not str(metadata.get("result") or "").strip():
+        return "result must be non-empty"
+    if not isinstance(metadata.get("artifacts"), list):
+        return "artifacts must be a list (use [] for an artifact-free result)"
+    if not str(metadata.get("wiki_candidate_reason") or "").strip():
+        return "wiki_candidate_reason must be non-empty"
+
+    disposition = metadata.get("wiki_disposition")
+    if not isinstance(disposition, dict):
+        return "wiki_disposition must be an object with status and reason"
+    disposition_status = str(disposition.get("status") or "").strip().lower()
+    if disposition_status not in _TTC_WIKI_DISPOSITION_STATUSES:
+        allowed = " | ".join(sorted(_TTC_WIKI_DISPOSITION_STATUSES))
+        return f"wiki_disposition.status must be one of: {allowed}"
+    if not str(disposition.get("reason") or "").strip():
+        return "wiki_disposition.reason must be non-empty"
+
+    reference = metadata.get("reference_receipt")
+    if not isinstance(reference, dict):
+        return "reference_receipt must be an object"
+    reference_required = (
+        "wiki_head",
+        "practice_body_emitted",
+        "index",
+        "recent_log_entries",
+        "relevant_docs",
+        "as_of",
+        "gaps",
+    )
+    reference_missing = [key for key in reference_required if key not in reference]
+    if reference_missing:
+        return "reference_receipt missing: " + ", ".join(reference_missing)
+    if reference.get("practice_body_emitted") is not True:
+        return "reference_receipt.practice_body_emitted must be true"
+    if not isinstance(reference.get("relevant_docs"), list):
+        return "reference_receipt.relevant_docs must be a list"
+    if not isinstance(reference.get("gaps"), list):
+        return "reference_receipt.gaps must be a list"
+
+    practice = metadata.get("practice_candidate")
+    if isinstance(practice, dict):
+        practice_result = practice.get("result")
+        practice_reason = practice.get("reason")
+    else:
+        practice_result = practice
+        practice_reason = metadata.get("practice_candidate_reason")
+    if str(practice_result or "").strip().lower() not in {
+        "yes",
+        "no",
+        "true",
+        "false",
+        "1",
+        "0",
+    }:
+        return "practice_candidate.result must be yes or no"
+    if not str(practice_reason or "").strip():
+        return "practice_candidate must include a non-empty reason"
+
+    is_candidate = _ttc_yes(metadata.get("wiki_candidate"))
+    if is_candidate and disposition_status == "none":
+        return "wiki_candidate yes cannot use wiki_disposition.status none"
+    if not is_candidate and disposition_status != "none":
+        return "wiki_candidate no must use wiki_disposition.status none"
+
+    profile = str(metadata.get("profile") or "").strip().lower()
+    if is_candidate and profile not in {"coo", "knowledge-steward"}:
+        targets = _ttc_handoff_targets(metadata.get("handoff_to"))
+        if not any("knowledge-steward" in target for target in targets):
+            return (
+                "a specialist wiki_candidate requires a durable "
+                "knowledge-steward handoff_to target"
+            )
+        if disposition_status != "candidate-routed":
+            return (
+                "a specialist wiki_candidate must use "
+                "wiki_disposition.status candidate-routed"
+            )
+    return None
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     tid = _default_task_id(args.get("task_id"))
@@ -586,6 +726,14 @@ def _handle_complete(args: dict, **kw) -> str:
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    lifecycle_error = _validate_ttc_wiki_lifecycle_metadata(metadata)
+    if lifecycle_error:
+        return tool_error(
+            "kanban_complete blocked by the TTC Wiki lifecycle gate: "
+            f"{lifecycle_error}. The task is still in-flight. Retry "
+            "kanban_complete with a complete reference, Practice, Wiki "
+            "disposition, and handoff receipt."
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")

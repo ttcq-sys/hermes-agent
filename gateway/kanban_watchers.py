@@ -25,6 +25,22 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _wiki_disposition_suffix(disposition: Any) -> str:
+    """Render one privacy-safe owner line for a durable Wiki disposition."""
+    if not isinstance(disposition, dict):
+        return ""
+    status = str(disposition.get("status") or "").strip().lower()
+    messages = {
+        "candidate-routed": "Wiki: 중요사항 후보를 지식참모 검토로 넘겼습니다.",
+        "approval-pending": "Wiki: 반영 후보가 원장 승인 대기 중입니다.",
+        "draft-pr": "Wiki: 승인 범위의 Draft PR이 준비됐습니다.",
+        "saved": "Wiki: 승인된 중요사항이 정본에 반영됐습니다.",
+        "blocked": "Wiki: 중요사항 후보 처리가 차단됐습니다.",
+    }
+    message = messages.get(status)
+    return f"\n{message}" if message else ""
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -283,6 +299,13 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
                                 )
+                                run_metadata: dict[int, dict[str, Any]] = {}
+                                for event in events:
+                                    if event.run_id is None:
+                                        continue
+                                    run = _kb.get_run(conn, event.run_id)
+                                    if run and isinstance(run.metadata, dict):
+                                        run_metadata[event.run_id] = run.metadata
                                 deliveries.append({
                                     "sub": sub,
                                     "old_cursor": old_cursor,
@@ -290,6 +313,7 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "run_metadata": run_metadata,
                                 })
                         finally:
                             conn.close()
@@ -361,9 +385,17 @@ class GatewayKanbanWatchersMixin:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
+                            disposition = {}
+                            if ev.run_id is not None:
+                                disposition = (
+                                    d.get("run_metadata", {})
+                                    .get(ev.run_id, {})
+                                    .get("wiki_disposition", {})
+                                )
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
+                                f"{_wiki_disposition_suffix(disposition)}"
                             )
                         elif kind == "blocked":
                             reason = ""
