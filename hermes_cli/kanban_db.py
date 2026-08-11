@@ -5911,6 +5911,10 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    An already-blocked human wait may be atomically retyped between
+    ``needs_input`` and ``capability`` without passing through ``ready`` or
+    ``triage``. This is not an unblock recurrence.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -5921,7 +5925,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -5938,6 +5943,37 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        if cur_row["status"] == "blocked":
+            human_kinds = {"needs_input", "capability"}
+            if kind not in human_kinds or prev_kind not in human_kinds:
+                return False
+            if (
+                expected_run_id is not None
+                and cur_row["current_run_id"] != int(expected_run_id)
+            ):
+                return False
+            if kind == prev_kind:
+                return True
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET block_kind = ?,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'blocked'
+                """,
+                (kind, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(
+                conn,
+                task_id,
+                "block_retyped",
+                {"reason": reason, "from_kind": prev_kind, "kind": kind},
+            )
+            return True
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing

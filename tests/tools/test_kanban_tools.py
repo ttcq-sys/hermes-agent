@@ -1051,3 +1051,444 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TTC fleet-wide Knowledge routing truth gate
+# ---------------------------------------------------------------------------
+
+
+def _valid_ttc_knowledge_route(source_task_id, basis="changed"):
+    route = {
+        "schema": "ttc-knowledge-route/v1",
+        "basis": basis,
+        "source_task_id": source_task_id,
+        "durable_active_document_impact": True,
+        "concrete_evidence_refs": ["kanban:non-sensitive-evidence"],
+        "routine_review_insufficient_reason": (
+            "The active durable document is affected before the routine review."
+        ),
+    }
+    if basis == "explicit-owner-wiki-review":
+        route["owner_wiki_review_ref"] = "owner-review:current-approved-request"
+    return route
+
+
+def _complete_ttc_receipt(
+    worker_env,
+    *,
+    profile="source-steward",
+    result="changed",
+    wiki_candidate="yes",
+    disposition="candidate-routed",
+    handoff_evidence=None,
+    handoff_status="delivered",
+    route=None,
+):
+    metadata = {
+        "clinic_id": "tatoa-yongin",
+        "profile": profile,
+        "result": result,
+        "artifacts": [],
+        "wiki_candidate": wiki_candidate,
+        "wiki_candidate_reason": "A durable active document claim changed.",
+        "wiki_disposition": {
+            "status": disposition,
+            "reason": "A durable active document claim changed.",
+            "refs": [],
+        },
+        "handoff_to": ["knowledge-steward"],
+        "handoff_status": handoff_status,
+        "handoff_evidence": handoff_evidence or [],
+        "reference_receipt": {
+            "wiki_head": "a" * 40,
+            "practice_body_emitted": True,
+            "index": "tatoa-yongin-wiki/index.md",
+            "recent_log_entries": 3,
+            "relevant_docs": [],
+            "as_of": "2026-08-11T16:00:00+09:00",
+            "gaps": [],
+        },
+        "practice_candidate": {
+            "result": "no",
+            "reason": "No reusable profile method changed.",
+        },
+    }
+    if route is not None:
+        metadata["ttc_knowledge_route"] = route
+    return metadata
+
+
+def test_ttc_knowledge_route_is_typed_in_create_schema():
+    from tools import kanban_tools as kt
+
+    prop = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["ttc_knowledge_route"]
+    assert prop["type"] == "object"
+    assert prop["additionalProperties"] is False
+    assert "source_task_id" in prop["required"]
+
+
+def test_non_ttc_knowledge_create_remains_unaffected(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("TTC_WIKI_LIFECYCLE_REQUIRED", raising=False)
+    output = json.loads(kt._handle_create({
+        "title": "ordinary upstream child",
+        "assignee": "knowledge-steward",
+        "parents": [worker_env],
+    }))
+    assert output.get("ok") is True
+
+
+def test_ttc_knowledge_create_missing_packet_has_zero_mutation(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    with kb.connect() as conn:
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    output = json.loads(kt._handle_create({
+        "title": "status drift should not route",
+        "assignee": "knowledge-steward",
+        "parents": [worker_env],
+    }))
+    assert "TTC Knowledge routing gate" in output.get("error", "")
+    with kb.connect() as conn:
+        after = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    assert after == before
+
+
+@pytest.mark.parametrize("basis", ["changed", "explicit-owner-wiki-review"])
+def test_ttc_knowledge_create_accepts_valid_typed_packet(monkeypatch, worker_env, basis):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    output = json.loads(kt._handle_create({
+        "title": "substantive Knowledge review",
+        "assignee": "knowledge-steward",
+        "parents": [worker_env],
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env, basis),
+    }))
+    assert output.get("ok") is True
+    with kb.connect() as conn:
+        child = kb.get_task(conn, output["task_id"])
+        assert child.assignee == "knowledge-steward"
+
+
+def test_ttc_knowledge_create_rejects_missing_source_task(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    phantom = "t_deadbeef"
+    output = json.loads(kt._handle_create({
+        "title": "phantom source",
+        "assignee": "knowledge-steward",
+        "parents": [phantom],
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(phantom),
+    }))
+    assert "does not exist" in output.get("error", "")
+
+
+def test_ttc_completion_rejects_no_change_candidate_and_keeps_running(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    metadata = _complete_ttc_receipt(
+        worker_env,
+        result="no-change",
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    output = json.loads(kt._handle_complete({"summary": "bad", "metadata": metadata}))
+    assert "no-change" in output.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_requires_real_knowledge_handoff(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    metadata = _complete_ttc_receipt(
+        worker_env,
+        handoff_evidence=["kanban:t_deadbeef"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    output = json.loads(kt._handle_complete({"summary": "bad", "metadata": metadata}))
+    assert "existing task assigned to knowledge-steward" in output.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_rejects_spawn_failed_knowledge_handoff(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff that cannot start",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, child_id, claimer="knowledge-worker")
+        assert claimed is not None
+        assert not kb._record_spawn_failure(
+            conn,
+            child_id,
+            "worker failed to start",
+            failure_limit=99,
+        )
+        assert kb.get_task(conn, child_id).status == "ready"
+        assert kb.latest_run(conn, child_id).outcome == "spawn_failed"
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading delivered handoff",
+        "metadata": misleading,
+    }))
+    assert "failed" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_rejects_running_child_claimed_as_completed(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff still running",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, child_id, claimer="knowledge-worker") is not None
+        assert kb.get_task(conn, child_id).status == "running"
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="completed",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading completed handoff",
+        "metadata": misleading,
+    }))
+    assert "completed" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_rejects_unfinished_archived_child_as_completed(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff archived before work",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        assert kb.archive_task(conn, child_id)
+        assert kb.get_task(conn, child_id).status == "archived"
+        assert kb.latest_run(conn, child_id) is None
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="completed",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading archived completion",
+        "metadata": misleading,
+    }))
+    assert "completed" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_completion_accepts_archived_child_with_completed_run(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff completed before archive",
+        "assignee": "knowledge-steward",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, child_id, claimer="knowledge-worker") is not None
+        assert kb.complete_task(conn, child_id, result="Knowledge review complete")
+        assert kb.archive_task(conn, child_id)
+        assert kb.get_task(conn, child_id).status == "archived"
+        assert kb.latest_run(conn, child_id).outcome == "completed"
+
+    receipt = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="completed",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    accepted = json.loads(kt._handle_complete({
+        "summary": "truthful archived completion",
+        "metadata": receipt,
+    }))
+    assert accepted.get("ok") is True
+
+
+def test_ttc_completion_rejects_triage_child_claimed_as_reviewing(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "Knowledge handoff still in triage",
+        "assignee": "knowledge-steward",
+        "triage": True,
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_id).status == "triage"
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_status="reviewing",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading review handoff",
+        "metadata": misleading,
+    }))
+    assert "reviewing" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_ttc_blocked_knowledge_child_requires_truthful_blocked_receipt(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    child_out = json.loads(kt._handle_create({
+        "title": "blocked Knowledge review",
+        "assignee": "knowledge-steward",
+        "parents": [worker_env],
+        "initial_status": "blocked",
+        "ttc_knowledge_route": _valid_ttc_knowledge_route(worker_env),
+    }))
+    assert child_out.get("ok") is True
+    child_id = child_out["task_id"]
+
+    misleading = _complete_ttc_receipt(
+        worker_env,
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    rejected = json.loads(kt._handle_complete({
+        "summary": "misleading",
+        "metadata": misleading,
+    }))
+    assert "blocked Knowledge child" in rejected.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+    truthful = _complete_ttc_receipt(
+        worker_env,
+        disposition="blocked",
+        handoff_status="blocked",
+        handoff_evidence=[f"kanban:{child_id}"],
+        route=_valid_ttc_knowledge_route(worker_env),
+    )
+    accepted = json.loads(kt._handle_complete({
+        "summary": "truthful blocked handoff",
+        "metadata": truthful,
+    }))
+    assert accepted.get("ok") is True
+
+
+def test_ttc_knowledge_steward_own_reconciliation_path_is_preserved(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    monkeypatch.setenv("HERMES_PROFILE", "knowledge-steward")
+    metadata = _complete_ttc_receipt(
+        worker_env,
+        profile="knowledge-steward",
+        result="changed",
+        disposition="approval-pending",
+        handoff_evidence=["owner-review:pending"],
+        handoff_status="delivered",
+        route=None,
+    )
+    output = json.loads(kt._handle_complete({
+        "summary": "Knowledge reconciliation complete",
+        "metadata": metadata,
+    }))
+    assert output.get("ok") is True
+
+
+def test_ttc_declared_knowledge_profile_alone_cannot_bypass_gate(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("TTC_WIKI_LIFECYCLE_REQUIRED", "1")
+    monkeypatch.setenv("HERMES_PROFILE", "source-steward")
+    metadata = _complete_ttc_receipt(
+        worker_env,
+        profile="knowledge-steward",
+        result="changed",
+        disposition="approval-pending",
+        handoff_evidence=["owner-review:pending"],
+        route=None,
+    )
+    output = json.loads(kt._handle_complete({
+        "summary": "spoofed Knowledge profile",
+        "metadata": metadata,
+    }))
+    assert "ttc_knowledge_route must be an object" in output.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"

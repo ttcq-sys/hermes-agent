@@ -9129,15 +9129,43 @@ def _finalize_update_output(state):
             pass
 
 
-def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name.
+def _read_repository_update_branch() -> str | None:
+    """Return the local repository's durable update-channel pin, if present.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    ``git config --local hermes.updateBranch <branch>`` lives outside the
+    checked-out tree, so normal pulls cannot erase it.  A missing or unreadable
+    pin intentionally falls back to Hermes' historical ``main`` default.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    try:
+        result = subprocess.run(
+            ["git", "config", "--local", "--get", "hermes.updateBranch"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    branch = result.stdout.strip()
+    return branch or None
+
+
+def _resolve_update_branch(args) -> str:
+    """Resolve an explicit branch, then a durable repository pin, then main.
+
+    Every update consumer uses this function, so ``--check``, git updates and
+    the Windows ZIP fail-closed path agree on the same target.  An explicit
+    ``--branch`` always wins over the repository policy.
+    """
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+
+    return _read_repository_update_branch() or "main"
 
 
 def _size_delta_label(saved_mb: float) -> str:

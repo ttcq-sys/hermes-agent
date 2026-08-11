@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -652,6 +653,354 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+_TTC_WIKI_DISPOSITION_STATUSES = {
+    "none",
+    "candidate-routed",
+    "approval-pending",
+    "draft-pr",
+    "saved",
+    "blocked",
+}
+
+_TTC_KNOWLEDGE_ROUTE_SCHEMA = "ttc-knowledge-route/v1"
+_TTC_KNOWLEDGE_ROUTE_KEYS = {
+    "schema",
+    "basis",
+    "source_task_id",
+    "durable_active_document_impact",
+    "concrete_evidence_refs",
+    "routine_review_insufficient_reason",
+    "owner_wiki_review_ref",
+}
+_TTC_TASK_ID_RE = re.compile(r"^t_[a-f0-9]{8,}$")
+_TTC_TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+_TTC_KNOWLEDGE_UNSUCCESSFUL_RUN_OUTCOMES = {
+    "crashed",
+    "failed",
+    "gave_up",
+    "queued",
+    "rate_limited",
+    "reclaimed",
+    "spawn_failed",
+    "stale",
+    "timed_out",
+}
+
+
+def _ttc_yes(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _ttc_handoff_targets(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip().lower() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip().lower()
+    return [text] if text else []
+
+
+def _validate_ttc_knowledge_route(
+    route: Any,
+    *,
+    allowed_source_ids: Optional[set[str]] = None,
+    result: Optional[str] = None,
+) -> str | None:
+    """Validate the closed, typed TTC Knowledge routing packet."""
+    if not isinstance(route, dict):
+        return "ttc_knowledge_route must be an object"
+    unknown = sorted(set(route) - _TTC_KNOWLEDGE_ROUTE_KEYS)
+    if unknown:
+        return "ttc_knowledge_route contains unsupported fields: " + ", ".join(unknown)
+    required = (
+        "schema",
+        "basis",
+        "source_task_id",
+        "durable_active_document_impact",
+        "concrete_evidence_refs",
+        "routine_review_insufficient_reason",
+    )
+    missing = [key for key in required if key not in route]
+    if missing:
+        return "ttc_knowledge_route missing: " + ", ".join(missing)
+    if route.get("schema") != _TTC_KNOWLEDGE_ROUTE_SCHEMA:
+        return "ttc_knowledge_route.schema must be ttc-knowledge-route/v1"
+    basis = route.get("basis")
+    if basis not in {"changed", "conflict", "explicit-owner-wiki-review"}:
+        return (
+            "ttc_knowledge_route.basis must be changed, conflict, or "
+            "explicit-owner-wiki-review"
+        )
+    source_task_id = route.get("source_task_id")
+    if not isinstance(source_task_id, str) or not _TTC_TASK_ID_RE.fullmatch(
+        source_task_id.strip()
+    ):
+        return "ttc_knowledge_route.source_task_id must be a real t_ task id"
+    source_task_id = source_task_id.strip()
+    if allowed_source_ids is not None and source_task_id not in allowed_source_ids:
+        return (
+            "ttc_knowledge_route.source_task_id must be the current worker task "
+            "or one of its parents"
+        )
+    if route.get("durable_active_document_impact") is not True:
+        return "ttc_knowledge_route.durable_active_document_impact must be true"
+    refs = route.get("concrete_evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return "ttc_knowledge_route.concrete_evidence_refs must be a non-empty list"
+    for ref in refs:
+        if not isinstance(ref, str) or not ref.strip():
+            return "ttc_knowledge_route.concrete_evidence_refs must contain non-empty refs"
+        clean_ref = ref.strip()
+        if redact_sensitive_text(clean_ref, force=True) != clean_ref:
+            return "ttc_knowledge_route.concrete_evidence_refs must be non-sensitive"
+    reason = route.get("routine_review_insufficient_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return "ttc_knowledge_route.routine_review_insufficient_reason must be non-empty"
+    if basis == "explicit-owner-wiki-review":
+        owner_ref = route.get("owner_wiki_review_ref")
+        if not isinstance(owner_ref, str) or not owner_ref.strip():
+            return (
+                "ttc_knowledge_route.owner_wiki_review_ref is required for "
+                "explicit-owner-wiki-review"
+            )
+        if redact_sensitive_text(owner_ref.strip(), force=True) != owner_ref.strip():
+            return "ttc_knowledge_route.owner_wiki_review_ref must be non-sensitive"
+    if result is not None:
+        if basis == "changed" and result != "changed":
+            return "ttc_knowledge_route.basis changed requires result changed"
+        if basis == "conflict" and result != "conflict":
+            return "ttc_knowledge_route.basis conflict requires result conflict"
+    return None
+
+
+def _ttc_handoff_task_ids(value: Any) -> list[str]:
+    """Extract real-looking task ids from structured handoff evidence."""
+    if isinstance(value, (list, tuple)):
+        values = [str(item) for item in value]
+    elif value is None:
+        values = []
+    else:
+        values = [str(value)]
+    found: list[str] = []
+    for text in values:
+        for task_id in _TTC_TASK_ID_PROSE_RE.findall(text):
+            if task_id not in found:
+                found.append(task_id)
+    return found
+
+
+def _validate_ttc_knowledge_completion(
+    metadata: dict,
+    *,
+    kb: Any,
+    conn: Any,
+    task_id: str,
+) -> str | None:
+    """Validate a non-Knowledge candidate against the selected live board."""
+    if not _ttc_yes(metadata.get("wiki_candidate")):
+        return None
+    result = str(metadata.get("result") or "").strip().lower()
+    if result == "no-change":
+        return "result no-change cannot claim wiki_candidate yes"
+    profile = str(metadata.get("profile") or "").strip().lower()
+    current_task = kb.get_task(conn, task_id)
+    runtime_profile = str(os.environ.get("HERMES_PROFILE") or "").strip().lower()
+    actual_knowledge_profile = (
+        profile == "knowledge-steward"
+        and (
+            runtime_profile == "knowledge-steward"
+            or (
+                current_task is not None
+                and str(current_task.assignee or "").strip().lower()
+                == "knowledge-steward"
+            )
+        )
+    )
+    if actual_knowledge_profile:
+        # Knowledge-steward owns reconciliation and may use its own valid
+        # changed/conflict/owner-review outcomes without a child handoff.
+        return None
+    parent_ids = set(kb.parent_ids(conn, task_id))
+    route_error = _validate_ttc_knowledge_route(
+        metadata.get("ttc_knowledge_route"),
+        allowed_source_ids=parent_ids | {task_id},
+        result=result,
+    )
+    if route_error:
+        return route_error
+
+    handoff_ids = _ttc_handoff_task_ids(metadata.get("handoff_evidence"))
+    if not handoff_ids:
+        return "handoff_evidence must contain a real Knowledge task id"
+    knowledge_task = None
+    for handoff_id in handoff_ids:
+        candidate = kb.get_task(conn, handoff_id)
+        if candidate is not None and candidate.assignee == "knowledge-steward":
+            knowledge_task = candidate
+            break
+    if knowledge_task is None:
+        return (
+            "handoff_evidence must reference an existing task assigned to "
+            "knowledge-steward"
+        )
+
+    disposition = metadata.get("wiki_disposition") or {}
+    disposition_status = str(disposition.get("status") or "").strip().lower()
+    handoff_status = str(metadata.get("handoff_status") or "").strip().lower()
+    latest = kb.latest_run(conn, knowledge_task.id)
+    latest_outcome = str(latest.outcome or "").strip().lower() if latest else ""
+    child_blocked = knowledge_task.status == "blocked"
+    child_completed = knowledge_task.status == "done" or (
+        knowledge_task.status == "archived" and latest_outcome == "completed"
+    )
+    child_failed = (
+        knowledge_task.status in {"failed", "cancelled"}
+        or latest_outcome in _TTC_KNOWLEDGE_UNSUCCESSFUL_RUN_OUTCOMES
+        or (knowledge_task.status == "archived" and not child_completed)
+    )
+    if child_blocked:
+        if disposition_status != "blocked":
+            return (
+                "a blocked Knowledge child cannot be claimed as candidate-routed "
+                "or delivered; use wiki_disposition.status blocked"
+            )
+        if handoff_status and handoff_status != "blocked":
+            return "a blocked Knowledge child requires handoff_status blocked when present"
+    elif disposition_status == "blocked":
+        return "wiki_disposition.status blocked requires a blocked Knowledge child"
+    if handoff_status == "completed" and not child_completed:
+        return "handoff_status completed requires completed Knowledge work"
+    if child_failed and (
+        disposition_status == "candidate-routed" or handoff_status == "delivered"
+    ):
+        return "failed, timed-out, or queued Knowledge work cannot be claimed delivered"
+    if handoff_status == "reviewing" and knowledge_task.status not in {
+        "running",
+        "review",
+    }:
+        return "handoff_status reviewing requires active Knowledge review work"
+    return None
+
+
+def _validate_ttc_wiki_lifecycle_metadata(metadata: Any) -> str | None:
+    """Return a fail-closed TTC Wiki lifecycle error, or ``None``.
+
+    The gate is opt-in so upstream Hermes boards are unaffected. The TTC
+    launcher enables it for every local Yongin profile and worker.
+    """
+    if os.environ.get("TTC_WIKI_LIFECYCLE_REQUIRED") != "1":
+        return None
+    if not isinstance(metadata, dict):
+        return (
+            "metadata must be an object containing clinic_id, profile, result, "
+            "artifacts, wiki_candidate, wiki_candidate_reason, wiki_disposition, "
+            "handoff_to, handoff_evidence, reference_receipt, and practice_candidate"
+        )
+
+    required = (
+        "clinic_id",
+        "profile",
+        "result",
+        "artifacts",
+        "wiki_candidate",
+        "wiki_candidate_reason",
+        "wiki_disposition",
+        "handoff_to",
+        "handoff_evidence",
+        "reference_receipt",
+        "practice_candidate",
+    )
+    missing = [key for key in required if key not in metadata]
+    if missing:
+        return "missing required fields: " + ", ".join(missing)
+    if metadata.get("clinic_id") != "tatoa-yongin":
+        return "clinic_id must be tatoa-yongin"
+    if not str(metadata.get("profile") or "").strip():
+        return "profile must be non-empty"
+    if not str(metadata.get("result") or "").strip():
+        return "result must be non-empty"
+    if not isinstance(metadata.get("artifacts"), list):
+        return "artifacts must be a list (use [] for an artifact-free result)"
+    if not str(metadata.get("wiki_candidate_reason") or "").strip():
+        return "wiki_candidate_reason must be non-empty"
+
+    disposition = metadata.get("wiki_disposition")
+    if not isinstance(disposition, dict):
+        return "wiki_disposition must be an object with status and reason"
+    disposition_status = str(disposition.get("status") or "").strip().lower()
+    if disposition_status not in _TTC_WIKI_DISPOSITION_STATUSES:
+        allowed = " | ".join(sorted(_TTC_WIKI_DISPOSITION_STATUSES))
+        return f"wiki_disposition.status must be one of: {allowed}"
+    if not str(disposition.get("reason") or "").strip():
+        return "wiki_disposition.reason must be non-empty"
+
+    reference = metadata.get("reference_receipt")
+    if not isinstance(reference, dict):
+        return "reference_receipt must be an object"
+    reference_required = (
+        "wiki_head",
+        "practice_body_emitted",
+        "index",
+        "recent_log_entries",
+        "relevant_docs",
+        "as_of",
+        "gaps",
+    )
+    reference_missing = [key for key in reference_required if key not in reference]
+    if reference_missing:
+        return "reference_receipt missing: " + ", ".join(reference_missing)
+    if reference.get("practice_body_emitted") is not True:
+        return "reference_receipt.practice_body_emitted must be true"
+    if not isinstance(reference.get("relevant_docs"), list):
+        return "reference_receipt.relevant_docs must be a list"
+    if not isinstance(reference.get("gaps"), list):
+        return "reference_receipt.gaps must be a list"
+
+    practice = metadata.get("practice_candidate")
+    if isinstance(practice, dict):
+        practice_result = practice.get("result")
+        practice_reason = practice.get("reason")
+    else:
+        practice_result = practice
+        practice_reason = metadata.get("practice_candidate_reason")
+    if str(practice_result or "").strip().lower() not in {
+        "yes",
+        "no",
+        "true",
+        "false",
+        "1",
+        "0",
+    }:
+        return "practice_candidate.result must be yes or no"
+    if not str(practice_reason or "").strip():
+        return "practice_candidate must include a non-empty reason"
+
+    is_candidate = _ttc_yes(metadata.get("wiki_candidate"))
+    if is_candidate and str(metadata.get("result") or "").strip().lower() == "no-change":
+        return "result no-change cannot claim wiki_candidate yes"
+    if is_candidate and disposition_status == "none":
+        return "wiki_candidate yes cannot use wiki_disposition.status none"
+    if not is_candidate and disposition_status != "none":
+        return "wiki_candidate no must use wiki_disposition.status none"
+
+    profile = str(metadata.get("profile") or "").strip().lower()
+    if is_candidate and profile not in {"coo", "knowledge-steward"}:
+        targets = _ttc_handoff_targets(metadata.get("handoff_to"))
+        if not any("knowledge-steward" in target for target in targets):
+            return (
+                "a specialist wiki_candidate requires a durable "
+                "knowledge-steward handoff_to target"
+            )
+        if disposition_status not in {"candidate-routed", "blocked"}:
+            return (
+                "a specialist wiki_candidate must use "
+                "wiki_disposition.status candidate-routed or blocked"
+            )
+    return None
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -741,6 +1090,27 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if (
+        os.environ.get("TTC_WIKI_LIFECYCLE_REQUIRED") == "1"
+        and isinstance(metadata, dict)
+        and "ttc_knowledge_route" in metadata
+    ):
+        raw_route_error = _validate_ttc_knowledge_route(
+            metadata.get("ttc_knowledge_route")
+        )
+        if raw_route_error:
+            return tool_error(
+                "kanban_complete blocked by the TTC Knowledge routing gate: "
+                f"{raw_route_error}. The task is still in-flight."
+            )
+    lifecycle_error = _validate_ttc_wiki_lifecycle_metadata(metadata)
+    if lifecycle_error:
+        return tool_error(
+            "kanban_complete blocked by the TTC Wiki lifecycle gate: "
+            f"{lifecycle_error}. The task is still in-flight. Retry "
+            "kanban_complete with a complete reference, Practice, Wiki "
+            "disposition, and handoff receipt."
+        )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -752,6 +1122,21 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            if (
+                os.environ.get("TTC_WIKI_LIFECYCLE_REQUIRED") == "1"
+                and isinstance(metadata, dict)
+            ):
+                ttc_completion_error = _validate_ttc_knowledge_completion(
+                    metadata,
+                    kb=kb,
+                    conn=conn,
+                    task_id=tid,
+                )
+                if ttc_completion_error:
+                    return tool_error(
+                        "kanban_complete blocked by the TTC Knowledge routing gate: "
+                        f"{ttc_completion_error}. The task is still in-flight."
+                    )
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -764,7 +1149,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"or (2) create continuation tasks with parents=[{tid}] "
                     f"and keep this task alive."
                 )
-
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -1419,10 +1803,41 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    ttc_knowledge_route = args.get("ttc_knowledge_route")
+    ttc_knowledge_source_id = None
+    if (
+        os.environ.get("TTC_WIKI_LIFECYCLE_REQUIRED") == "1"
+        and str(assignee).strip().lower() == "knowledge-steward"
+    ):
+        allowed_source_ids = {str(parent).strip() for parent in parents}
+        current_task_id = os.environ.get("HERMES_KANBAN_TASK")
+        if current_task_id:
+            allowed_source_ids.add(current_task_id)
+        route_error = _validate_ttc_knowledge_route(
+            ttc_knowledge_route,
+            allowed_source_ids=allowed_source_ids,
+        )
+        if route_error:
+            return tool_error(
+                "kanban_create blocked by the TTC Knowledge routing gate: "
+                f"{route_error}. No task was created."
+            )
+        ttc_knowledge_source_id = str(
+            ttc_knowledge_route["source_task_id"]
+        ).strip()
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            if (
+                ttc_knowledge_source_id is not None
+                and kb.get_task(conn, ttc_knowledge_source_id) is None
+            ):
+                return tool_error(
+                    "kanban_create blocked by the TTC Knowledge routing gate: "
+                    "ttc_knowledge_route.source_task_id does not exist on the "
+                    "selected board. No task was created."
+                )
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -2169,6 +2584,46 @@ KANBAN_CREATE_SCHEMA = {
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),
+            },
+            "ttc_knowledge_route": {
+                "type": "object",
+                "description": (
+                    "TTC Yongin only: required when assignee is "
+                    "knowledge-steward. Closed route evidence proving a "
+                    "changed/conflict result or an explicit owner Wiki review."
+                ),
+                "properties": {
+                    "schema": {
+                        "type": "string",
+                        "enum": ["ttc-knowledge-route/v1"],
+                    },
+                    "basis": {
+                        "type": "string",
+                        "enum": [
+                            "changed",
+                            "conflict",
+                            "explicit-owner-wiki-review",
+                        ],
+                    },
+                    "source_task_id": {"type": "string"},
+                    "durable_active_document_impact": {"type": "boolean"},
+                    "concrete_evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "routine_review_insufficient_reason": {"type": "string"},
+                    "owner_wiki_review_ref": {"type": "string"},
+                },
+                "required": [
+                    "schema",
+                    "basis",
+                    "source_task_id",
+                    "durable_active_document_impact",
+                    "concrete_evidence_refs",
+                    "routine_review_insufficient_reason",
+                ],
+                "additionalProperties": False,
             },
             "tenant": {
                 "type": "string",
