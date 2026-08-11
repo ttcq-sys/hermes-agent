@@ -64,14 +64,14 @@ describe('backend action helpers are profile-scoped', () => {
   })
 
   it('forwards the active profile to every messaging action', () => {
-    setApiRequestProfile('front-source-steward')
+    setApiRequestProfile('specialist')
 
     void getMessagingPlatforms()
     void updateMessagingPlatform('telegram', { enabled: true })
     void testMessagingPlatform('telegram')
 
     for (const call of api.mock.calls) {
-      expect(call[0].profile).toBe('front-source-steward')
+      expect(call[0].profile).toBe('specialist')
     }
   })
 })
