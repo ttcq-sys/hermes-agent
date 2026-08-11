@@ -618,6 +618,7 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    completion_vetoes: Optional[list[str]] = None
 
 
 @router.post("/tasks")
@@ -646,6 +647,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            completion_vetoes=payload.completion_vetoes,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)

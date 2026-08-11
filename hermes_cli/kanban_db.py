@@ -3205,12 +3205,27 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, completion_vetoes FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            raw_existing = row["completion_vetoes"]
+            try:
+                existing_vetoes = (
+                    []
+                    if raw_existing in (None, "")
+                    else _normalize_completion_vetoes(json.loads(raw_existing))
+                )
+            except Exception as exc:
+                raise ValueError(
+                    "idempotency completion_vetoes contract is invalid"
+                ) from exc
+            if existing_vetoes != completion_vetoes_list:
+                raise ValueError(
+                    "idempotency completion_vetoes contract mismatch"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -5126,6 +5141,27 @@ def _safe_veto_code(value: object, fallback: str) -> str:
     return fallback
 
 
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Derive the canonical board slug from the connection's main DB path."""
+    try:
+        main = next(
+            row for row in conn.execute("PRAGMA database_list").fetchall()
+            if row[1] == "main"
+        )
+        db_path = Path(str(main[2])).resolve()
+        if db_path == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        relative = db_path.relative_to(boards_root().resolve())
+        if len(relative.parts) == 2 and relative.parts[1] == "kanban.db":
+            return _normalize_board_slug(relative.parts[0]) or DEFAULT_BOARD
+        pinned = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if pinned:
+            return _normalize_board_slug(pinned) or DEFAULT_BOARD
+    except Exception:
+        pass
+    return get_current_board()
+
+
 def _task_has_completion_veto_config(
     conn: sqlite3.Connection, task_id: str
 ) -> bool:
@@ -5134,15 +5170,7 @@ def _task_has_completion_veto_config(
         "SELECT completion_vetoes FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     raw = row["completion_vetoes"] if row else None
-    if raw is None or raw == "":
-        return False
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            return True
-        return bool(_normalize_completion_vetoes(parsed))
-    except Exception:
-        return True
+    return raw is not None and raw != ""
 
 
 def _evaluate_completion_vetoes(
@@ -5175,7 +5203,7 @@ def _evaluate_completion_vetoes(
             raise ValueError("completion_vetoes must be a list")
         policies = _normalize_completion_vetoes(parsed_policies)
         if not policies:
-            return True, [], []
+            raise ValueError("completion_vetoes must not be empty")
     except Exception:
         return False, ["invalid-completion-veto-config"], ["policy-config-invalid"]
 
@@ -5195,6 +5223,7 @@ def _evaluate_completion_vetoes(
     blocked: set[str] = set()
     codes: set[str] = set()
     callback_failed = False
+    response_invalid = False
     for callback in callbacks:
         try:
             decision = callback(
@@ -5205,7 +5234,7 @@ def _evaluate_completion_vetoes(
                 result=result,
                 summary=summary,
                 metadata=metadata,
-                board=get_current_board(),
+                board=_board_for_connection(conn),
                 inside_write_transaction=True,
             )
         except Exception:
@@ -5214,11 +5243,15 @@ def _evaluate_completion_vetoes(
         if decision is None:
             continue
         decisions = decision if isinstance(decision, list) else [decision]
+        if not decisions:
+            response_invalid = True
         for item in decisions:
             if not isinstance(item, dict):
+                response_invalid = True
                 continue
             policy = str(item.get("policy") or "").strip().lower()
             if policy not in policies:
+                response_invalid = True
                 continue
             action = str(item.get("decision") or "").strip().lower()
             if action == "allow":
@@ -5226,13 +5259,17 @@ def _evaluate_completion_vetoes(
             elif action == "block":
                 blocked.add(policy)
                 codes.add(_safe_veto_code(item.get("code"), "policy-blocked"))
+            else:
+                response_invalid = True
 
     if callback_failed:
         codes.add("provider-error")
+    if response_invalid:
+        codes.add("provider-response-invalid")
     missing = set(policies) - allowed
     if missing:
         codes.add("provider-missing-or-no-allow")
-    vetoed = bool(blocked or missing or callback_failed)
+    vetoed = bool(blocked or missing or callback_failed or response_invalid)
     return not vetoed, policies, sorted(codes)
 
 
@@ -5315,6 +5352,17 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Plugin discovery may import modules and touch configuration. Do it before
+    # the SQLite write lock, but only for tasks that carry a persisted guard
+    # contract. A discovery failure remains fail-closed in the evaluator below
+    # as a missing provider and is recorded atomically with the denied attempt.
+    if _task_has_completion_veto_config(conn, task_id):
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception:
+            pass
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
