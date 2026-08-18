@@ -705,6 +705,32 @@ class TestSlackSocketWatchdog:
 
             assert len(instances) == 1, "watchdog kept reconnecting after disconnect"
 
+    @pytest.mark.asyncio
+    async def test_successful_watchdog_reconnect_reports_connected(self, caplog):
+        """Health readers must see recovery after a degraded transport marker."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                caplog.clear()
+
+                with caplog.at_level("INFO", logger=_slack_mod.logger.name):
+                    await adapter._restart_socket_mode("transport disconnected")
+
+                assert len(instances) == 2
+                assert any(
+                    "Socket Mode connected" in record.getMessage()
+                    for record in caplog.records
+                ), "a successful reconnect left the health log permanently degraded"
+            finally:
+                await adapter.disconnect()
+
 
     @pytest.mark.asyncio
     async def test_watchdog_unexpected_exit_respawns_via_done_callback(self):
@@ -4558,4 +4584,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-
