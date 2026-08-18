@@ -1298,6 +1298,11 @@ class SlackAdapter(BasePlatformAdapter):
 
             try:
                 self._start_socket_mode_handler()
+                # Keep operational health readers in sync with the initial
+                # connect path: a successful handler rebuild must supersede the
+                # preceding degraded marker instead of leaving the connection
+                # permanently reported as down.
+                logger.info("[Slack] Socket Mode connected after reconnect")
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
