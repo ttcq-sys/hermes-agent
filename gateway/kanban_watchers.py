@@ -25,6 +25,29 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _resolve_kanban_notification_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[str, bool, bool]":
+    """Return ``(mode, wake_agent, include_task_id)`` for Kanban notices.
+
+    ``all`` preserves the historical event stream. ``final`` keeps only
+    completed, actionable-block, final-failure, review, and block-loop events;
+    transient crash/timeout/retry churn stays in the board audit log.  The
+    settings are deliberately config-backed so chat-heavy deployments can use
+    a quiet owner surface without changing the default product contract.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return "all", True, True
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw_mode = str(kcfg.get("notification_mode", "all") or "all").strip().lower()
+    mode = raw_mode if raw_mode in {"all", "final"} else "all"
+    wake_agent = bool(kcfg.get("notification_wake_agent", True))
+    include_task_id = bool(kcfg.get("notification_include_task_id", True))
+    return mode, wake_agent, include_task_id
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -172,13 +195,31 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            notification_mode, wake_agent, include_task_id = "all", True, True
+        else:
+            notification_mode, wake_agent, include_task_id = (
+                _resolve_kanban_notification_settings(_load_config)
+            )
+
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
         # ``review_requested`` wakes the origin subscriber like a block does,
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        all_kinds = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested",
+        )
+        final_kinds = (
+            "completed", "blocked", "gave_up", "block_loop_detected",
+            "review_requested", "archived", "unblocked",
+        )
+        TERMINAL_KINDS = final_kinds if notification_mode == "final" else all_kinds
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -433,6 +474,10 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        task_ref = (
+                            f"Kanban {sub['task_id']}"
+                            if include_task_id else "Kanban"
+                        )
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -452,40 +497,49 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                f"✔ {board_tag}{tag}{task_ref} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {board_tag}{tag}{task_ref} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"✖ {board_tag}{tag}{task_ref} stopped after "
+                                f"repeated failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {board_tag}{tag}{task_ref} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
-                            limit = 0
+                            limit = None
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
+                            err = ""
+                            if ev.payload and ev.payload.get("error"):
+                                err = f"\n{str(ev.payload['error'])[:200]}"
+                            if limit is not None:
+                                msg = (
+                                    f"⏱ {board_tag}{tag}{task_ref} timed out "
+                                    f"(max_runtime={limit}s); will retry{err}"
+                                )
+                            else:
+                                msg = (
+                                    f"⏱ {board_tag}{tag}{task_ref} stopped before "
+                                    f"completion; will retry{err}"
+                                )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                            msg = f"🔄 {board_tag}{tag}{task_ref} → {new_status}"
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
@@ -493,7 +547,7 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 handoff = f"\n{str(ev.payload['summary'])[:200]}"
                             msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
+                                f"👀 {board_tag}{tag}{task_ref} ready for review"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "block_loop_detected":
@@ -512,7 +566,7 @@ class GatewayKanbanWatchersMixin:
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
+                                f"🛑 {board_tag}{tag}{task_ref} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
@@ -652,7 +706,10 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = (
+                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            if wake_agent else set()
+                        )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)

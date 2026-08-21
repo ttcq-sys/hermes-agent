@@ -2338,8 +2338,23 @@ DEFAULT_CONFIG = {
         # agent that dispatched the task will get notified automatically
         # instead of having to poll. Disable to mirror pre-feature
         # behaviour — e.g. for a profile that prefers explicit
-        # ``kanban_notify-subscribe`` calls per task.
+        # ``kanban_notify-subscribe`` calls per task. ``roots`` subscribes
+        # only tasks without parents, which keeps delegated child churn out
+        # of an owner-facing channel.
         "auto_subscribe_on_create": True,
+        # Copy a parent's delivery subscriptions to newly-linked child tasks.
+        # Disable when the root task alone represents the user-facing outcome.
+        "inherit_notify_subscriptions": True,
+        # ``all`` preserves the full status/retry event stream. ``final``
+        # delivers only completed, blocked, final-failure, review, and
+        # block-loop events; retry details remain available in the board log.
+        "notification_mode": "all",
+        # Terminal notices historically wake the subscribed chat agent so it
+        # can explain the raw event. Disable to deliver a single deterministic
+        # notice without a second model-authored reply.
+        "notification_wake_agent": True,
+        # Internal task IDs are useful for operators but noisy for owner chats.
+        "notification_include_task_id": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

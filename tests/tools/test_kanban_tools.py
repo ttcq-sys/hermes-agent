@@ -867,6 +867,42 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_root_only_subscription_does_not_fan_out_to_child_tasks(
+    monkeypatch, worker_env, tmp_path,
+):
+    """A subscribed root must not turn every delegated child into chat noise."""
+    home = tmp_path / "root-only-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: roots\n"
+        "  inherit_notify_subscriptions: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "owner-thread")
+
+    from tools import kanban_tools as kt
+
+    root = json.loads(kt._handle_create({
+        "title": "owner root",
+        "assignee": "coordinator",
+    }))
+    assert root["ok"] is True
+    assert root["subscribed"] is True
+    assert len(_list_subs_for_task(root["task_id"])) == 1
+
+    child = json.loads(kt._handle_create({
+        "title": "internal child",
+        "assignee": "worker",
+        "parents": [root["task_id"]],
+    }))
+    assert child["ok"] is True
+    assert child["subscribed"] is False
+    assert _list_subs_for_task(child["task_id"]) == []
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent
