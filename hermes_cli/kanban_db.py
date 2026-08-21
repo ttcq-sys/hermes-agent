@@ -3413,8 +3413,21 @@ def _inherit_notify_subs(
     The inherited subscription starts caught up to the child's current event
     cursor. This makes manual `link_tasks(parent, existing_child)` safe: the
     parent chat receives future child terminal events without replaying the
-    child's pre-link history.
+    child's pre-link history. Deployments that reserve the owner channel for
+    root outcomes can disable this with
+    ``kanban.inherit_notify_subscriptions: false``.
     """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not bool(kcfg.get("inherit_notify_subscriptions", True)):
+            return
+    except Exception:
+        # Notification routing must never make task creation/linking fail.
+        # Preserve the historical default when config cannot be read.
+        pass
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
         return

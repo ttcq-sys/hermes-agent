@@ -1912,9 +1912,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     explicit ``kanban_notify-subscribe`` or to polling.
 
     Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). Disable to mirror pre-feature behaviour, e.g. when the
-    originating user/chat opted out via the per-platform notification
-    toggle (see ``hermes dashboard``).
+    True). ``false`` disables automatic subscriptions; ``roots`` subscribes
+    only cards without parents so a delegated graph reports its owner-facing
+    root instead of every child event.
 
     Subscription paths:
 
@@ -1942,8 +1942,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """
     try:
         cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+        auto_subscribe = cfg_get(
+            cfg, "kanban", "auto_subscribe_on_create", default=True,
+        )
+        if auto_subscribe is False:
             return False
+        if (
+            isinstance(auto_subscribe, str)
+            and auto_subscribe.strip().lower() in {"root", "roots", "root_only"}
+        ):
+            from hermes_cli import kanban_db as _kb
+
+            if _kb.parent_ids(conn, task_id):
+                return False
     except Exception:
         # If config can't load we still default to True — this is the
         # user-friendly behaviour that mirrors the pre-gate implementation.

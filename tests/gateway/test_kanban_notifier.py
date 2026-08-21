@@ -516,3 +516,121 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def _write_kanban_config(tmp_path, monkeypatch, body):
+    home = tmp_path / "config-home"
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
+def test_final_notification_mode_suppresses_retry_churn_and_agent_wake(
+    tmp_path, monkeypatch,
+):
+    """Quiet owner mode emits one final root notice, not retry + agent replies."""
+    db_path = tmp_path / "final-only.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _write_kanban_config(
+        tmp_path,
+        monkeypatch,
+        "kanban:\n"
+        "  notification_mode: final\n"
+        "  notification_wake_agent: false\n"
+        "  notification_include_task_id: false\n",
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="owner result",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "timed_out",
+            {"error": "Iteration budget exhausted (24/24)"},
+        )
+        kb._append_event(conn, tid, "crashed", {"pid": 123})
+        kb.complete_task(conn, tid, summary="final summary")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"]
+    assert "final summary" in adapter.sent[0]["text"]
+    assert tid not in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
+def test_iteration_budget_event_is_not_reported_as_zero_second_timeout(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "iteration-budget.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _write_kanban_config(tmp_path, monkeypatch, "kanban:\n  notification_mode: all\n")
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="budget", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "timed_out",
+            {"error": "Iteration budget exhausted (24/24)"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "stopped before completion" in adapter.sent[0]["text"]
+    assert "Iteration budget exhausted (24/24)" in adapter.sent[0]["text"]
+    assert "max_runtime=0s" not in adapter.sent[0]["text"]
+
+
+def test_gave_up_message_does_not_claim_every_failure_was_spawn_failure(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "gave-up-reason.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _write_kanban_config(tmp_path, monkeypatch, "kanban:\n  notification_mode: all\n")
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="budget", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "gave_up",
+            {"error": "Iteration budget exhausted (24/24)"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "stopped after repeated failures" in adapter.sent[0]["text"]
+    assert "spawn failures" not in adapter.sent[0]["text"]
