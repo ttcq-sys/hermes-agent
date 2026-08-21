@@ -217,7 +217,7 @@ class GatewayKanbanWatchersMixin:
         )
         final_kinds = (
             "completed", "blocked", "gave_up", "block_loop_detected",
-            "review_requested",
+            "review_requested", "archived", "unblocked",
         )
         TERMINAL_KINDS = final_kinds if notification_mode == "final" else all_kinds
         # Subscriptions are removed only when the task reaches a truly final

@@ -573,6 +573,43 @@ def test_final_notification_mode_suppresses_retry_churn_and_agent_wake(
     assert adapter.handled == []
 
 
+def test_final_notification_mode_silently_cleans_archived_subscription(
+    tmp_path, monkeypatch,
+):
+    """Quiet mode must still advance silent lifecycle events and unsubscribe."""
+    db_path = tmp_path / "final-archive.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _write_kanban_config(
+        tmp_path,
+        monkeypatch,
+        "kanban:\n  notification_mode: final\n",
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="archived", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        remaining = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ?", (tid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert remaining == []
+
+
 def test_iteration_budget_event_is_not_reported_as_zero_second_timeout(
     tmp_path, monkeypatch,
 ):
